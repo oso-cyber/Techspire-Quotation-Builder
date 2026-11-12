@@ -26,3 +26,7 @@ dist-ssr
 # Separate project repository
 africa-co-perfume/
 .git-backups/
+github-projects/
+prepare-github-projects.ps1
+push-github-projects.ps1
+sanitize-ferfume.ps1
