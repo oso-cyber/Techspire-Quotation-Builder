@@ -10,6 +10,10 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+/dist-desktop-debug/
+/dist-permissions/
+/Techspire-Quotation-Builder.exe
+/Techspire-Quotation-Builder-Setup-x64.exe
 *.local
 
 # Editor directories and files

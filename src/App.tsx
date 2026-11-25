@@ -1,3 +1,15 @@
+import { ItemImage } from './ItemImage'
+import { ClientForm, QuoteCustomerDetails } from './ClientForm'
+import { PackagesPage } from './PackagesPage'
+import { productAccessories } from './referencePackages'
+import { DEFAULT_PAYMENT_PLANS, paymentPlanLabel, type PaymentPlan } from './paymentPlans'
+import { PaymentOptions } from './PaymentOptions'
+import { QuoteWorkbench } from './QuoteWorkbench'
+import { SettingsPage } from './SettingsPage'
+import { quotationReport, reportTypes, type ReportType } from './quotationReports'
+import { quotationWorkbook } from './quotationWorkbook'
+import { canAccessSection, type UserProfile } from './auth'
+import { UsersPage } from './UsersPage'
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import {
   Archive,
@@ -7,7 +19,6 @@ import {
   BadgeCheck,
   BarChart3,
   Bell,
-  BriefcaseBusiness,
   Calculator,
   Check,
   ChevronDown,
@@ -34,18 +45,32 @@ import {
   X,
   RotateCcw,
 } from 'lucide-react'
-import { open, save } from '@tauri-apps/plugin-dialog'
+import { confirm, open, save } from '@tauri-apps/plugin-dialog'
 import { readFile, writeFile } from '@tauri-apps/plugin-fs'
 import { downloadDir, join } from '@tauri-apps/api/path'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import {
-  calculateTotals,
+  calculateOfferPayments,
+  calculateQuotePricing,
+  clientDisplayName,
+  filterMyQuotes,
+  filterQuoteHistory,
+  missingClientFields,
+  copyQuoteLines,
+  createPackageLine,
+  catalogueCategories,
+  packageCategory,
+  packageProducts,
+  supportsProductAccessories,
+  quoteOptions,
   catalogueNetPriceCents,
   centsFromInput,
   createId,
   createQuoteFromTemplate,
   dateAfter,
   money,
+  ALL_HISTORY_CREATORS,
+  UNRECORDED_HISTORY_CREATOR,
   today,
   type AppData,
   type CatalogueItem,
@@ -63,15 +88,12 @@ import {
   deleteQuoteTemplate,
   loadAppData,
   restoreDatabase,
-  saveCatalogueItem,
-  saveCatalogueItems,
   saveClient,
   savePackage,
   saveQuote,
   saveQuoteTemplate,
   saveSettings,
 } from './database'
-import { parseCsv } from './csv'
 import './App.css'
 
 const navigation: Array<{
@@ -82,13 +104,14 @@ const navigation: Array<{
 }> = [
   { label: 'Dashboard', section: 'dashboard', icon: LayoutDashboard, group: 'main' },
   { label: 'New quotation', section: 'builder', icon: FilePlus2, group: 'main' },
-  { label: 'Catalogue', section: 'catalogue', icon: ShoppingBag, group: 'manage' },
   { label: 'Packages', section: 'packages', icon: PackageOpen, group: 'manage' },
   { label: 'Quotation templates', section: 'templates', icon: Copy, group: 'manage' },
   { label: 'Clients', section: 'clients', icon: Users, group: 'manage' },
+  { label: 'My quotations', section: 'my-quotes', icon: FileText, group: 'manage' },
   { label: 'Quotation history', section: 'history', icon: FileClock, group: 'manage' },
   { label: 'Settings', section: 'settings', icon: Settings, group: 'system' },
   { label: 'Backup & restore', section: 'backup', icon: Archive, group: 'system' },
+  { label: 'Users & permissions', section: 'users', icon: Users, group: 'system' },
 ]
 
 const blankClient = (): Client => ({
@@ -117,7 +140,7 @@ const blankCatalogueItem = (): CatalogueItem => ({
   active: true,
 })
 
-const makeLine = (item: CatalogueItem): QuoteLine => ({
+const makeLine = (item: CatalogueItem, catalogue: CatalogueItem[] = [], includeAccessories = supportsProductAccessories(item.category)): QuoteLine => ({
   id: createId(),
   itemId: item.id,
   unit: item.unit,
@@ -125,9 +148,25 @@ const makeLine = (item: CatalogueItem): QuoteLine => ({
   description: item.description,
   sku: item.sku,
   quantity: 1,
+  minimumQuantity: item.minimumQuantity,
   unitPriceCents: item.priceCents,
+  costCents: item.costCents,
+  monthlyCents: item.monthlyCents,
+  imageDataUrl: item.imageDataUrl,
+  featureChoices: includeAccessories ? productAccessories(item, catalogue).filter((feature) => feature.active).map(({ accessories, featureItemIds, ...snapshot }) => {
+    void accessories
+    void featureItemIds
+    return snapshot
+  }) : undefined,
   vatApplicable: item.vatApplicable,
 })
+
+function withProductAccessories(parent: QuotePackage, product: CatalogueItem, accessories: CatalogueItem[]): QuotePackage {
+  return {
+    ...parent,
+    items: parent.items.map((entry) => entry.itemId === product.id ? { ...entry, product: { ...product, accessories } } : entry),
+  }
+}
 
 function isTauri() {
   return '__TAURI_INTERNALS__' in window
@@ -151,26 +190,42 @@ function statusTone(status: QuoteStatus) {
   return `status status-${status.toLowerCase()}`
 }
 
-function App() {
+function App({ currentUser, users, onSaveUsers }: {
+  currentUser: UserProfile
+  users: UserProfile[]
+  onSaveUsers: (users: UserProfile[]) => void
+}) {
   const [data, setData] = useState<AppData | null>(null)
   const [section, setSection] = useState<Section>('dashboard')
   const [quote, setQuote] = useState<Quote | null>(null)
+  const [selectedOptionId, setSelectedOptionId] = useState('')
   const [activeQuoteId, setActiveQuoteId] = useState<string | null>(null)
   const [generatedPdf, setGeneratedPdf] = useState<{ url: string; filename: string; quote: Quote } | null>(null)
   const [pdfViewerOpen, setPdfViewerOpen] = useState(false)
   const [modal, setModal] = useState<'client' | 'item' | 'package' | 'quote-template' | null>(null)
   const [editingClient, setEditingClient] = useState<Client | null>(null)
+  const [managedPackageId, setManagedPackageId] = useState<string | null>(null)
+  const [productPackageId, setProductPackageId] = useState<string | null>(null)
+  const [accessoryParent, setAccessoryParent] = useState<CatalogueItem | null>(null)
+  const [editingPackage, setEditingPackage] = useState<QuotePackage | null>(null)
   const [editingItem, setEditingItem] = useState<CatalogueItem | null>(null)
   const [search, setSearch] = useState('')
-  const [catalogueFilter, setCatalogueFilter] = useState('All categories')
   const [historyFilter, setHistoryFilter] = useState('All statuses')
+  const [historyCreatorFilter, setHistoryCreatorFilter] = useState(ALL_HISTORY_CREATORS)
+  const [historyDateRange, setHistoryDateRange] = useState({ from: '', to: '' })
+  const [myQuotesSearch, setMyQuotesSearch] = useState('')
+  const [myQuotesFilter, setMyQuotesFilter] = useState('All statuses')
+  const [myQuotesDateRange, setMyQuotesDateRange] = useState({ from: '', to: '' })
   const [busy, setBusy] = useState(false)
+  const [savingDraft, setSavingDraft] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [loadError, setLoadError] = useState('')
   const [displayDate] = useState(() =>
     new Intl.DateTimeFormat('en-ZA', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }).format(new Date()),
   )
+  const editingOption = quote?.alternatives?.find((option) => option.id === selectedOptionId)
+  const editingLines = editingOption?.lines ?? quote?.lines ?? []
   const lastAutoSavedQuote = useRef('')
 
   useEffect(() => {
@@ -192,16 +247,8 @@ function App() {
   }, [generatedPdf])
 
   useEffect(() => {
-    if (
-      busy ||
-      !quote ||
-      !data ||
-      quote.status !== 'Draft' ||
-      !quote.clientId ||
-      !quote.clientSnapshot.name.trim() ||
-      !quote.lines.length ||
-      quote.lines.some((line) => line.quantity <= 0 || line.unitPriceCents < 0)
-    ) return
+    if (busy || !quote || !data || quote.status !== 'Draft') return
+    if (!quoteOptions(quote).some((option) => option.lines.length) && !data.quotations.some((item) => item.id === quote.id)) return
     const draft = applyTotals({ ...quote, status: 'Draft' }, data)
     const signature = JSON.stringify(draft)
     if (signature === lastAutoSavedQuote.current) return
@@ -269,6 +316,7 @@ function App() {
       vatCents: 0,
       totalCents: 0,
       createdAt: new Date().toISOString(),
+      createdBy: currentUser.fullName,
       exportedFilename: '',
     })
     setSection('builder')
@@ -283,12 +331,7 @@ function App() {
       title: item.name,
       clientId: '',
       clientSnapshot: blankClient(),
-      lines: item.items.flatMap((entry) => {
-        const source = data.catalogue.find((catalogueItem) => catalogueItem.id === entry.itemId)
-        return source
-          ? [{ ...makeLine(source), quantity: entry.quantity, packageId: item.id, packageInstanceId: item.id, packageName: item.name }]
-          : []
-      }),
+      lines: [createPackageLine(item, data.catalogue)],
       issueDate: today(),
       validUntil: dateAfter(today(), data.settings.validityDays),
       discountType: 'none',
@@ -306,6 +349,7 @@ function App() {
       vatCents: 0,
       totalCents: 0,
       createdAt: new Date().toISOString(),
+      createdBy: currentUser.fullName,
       exportedFilename: '',
     }
     setActiveQuoteId(null)
@@ -316,181 +360,185 @@ function App() {
   function startQuoteFromTemplate(template: QuoteTemplate) {
     if (!data) return
     setActiveQuoteId(null)
-    setQuote(createQuoteFromTemplate(template, quoteNumber(data, quote), data.clients, data.settings))
+    setQuote({
+      ...createQuoteFromTemplate(template, quoteNumber(data, quote), data.clients, data.settings),
+      createdBy: currentUser.fullName,
+    })
     setSection('builder')
   }
 
   function openQuote(selected: Quote) {
-    if (!data) return
-    if (selected.status !== 'Draft') {
-      const revised = {
-        ...structuredClone(selected),
-        id: createId(),
-        number: quoteNumber(data, quote),
-        status: 'Draft' as const,
-        issueDate: today(),
-        validUntil: dateAfter(today(), data!.settings.validityDays),
-        createdAt: new Date().toISOString(),
-        exportedFilename: '',
-      }
-      setQuote(revised)
-      setActiveQuoteId(null)
-      setNotice(`A new draft revision was created. ${selected.number} remains unchanged.`)
-      setSection('builder')
-      return
+    if (!data || !canAccessSection(currentUser, 'builder')) return
+    if (quote?.id !== selected.id || quote.status !== 'Draft' || selected.status !== 'Draft') {
+      lastAutoSavedQuote.current = JSON.stringify(applyTotals(selected, data))
+      setQuote(structuredClone(selected))
+      setSelectedOptionId('')
     }
-    setQuote(structuredClone(selected))
     setActiveQuoteId(selected.id)
     setSection('builder')
   }
 
+  function duplicateQuote(item: Quote) {
+    if (!data || !canAccessSection(currentUser, 'builder')) return
+    setQuote({
+      ...structuredClone(item),
+      lines: copyQuoteLines(item.lines),
+      alternatives: item.alternatives?.map((option) => ({ ...option, id: createId(), lines: copyQuoteLines(option.lines) })),
+      id: createId(),
+      number: quoteNumber(data, quote),
+      status: 'Draft',
+      issueDate: today(),
+      validUntil: dateAfter(today(), data.settings.validityDays),
+      createdAt: new Date().toISOString(),
+      createdBy: currentUser.fullName,
+      exportedFilename: '',
+    })
+    setActiveQuoteId(null)
+    setSection('builder')
+  }
+
   function applyTotals(value: Quote, source: AppData): Quote {
-    const totals = calculateTotals(value.lines, value.discountType, value.discountValue, source.settings.vatRate)
+    const totals = calculateQuotePricing(value, source.settings.vatRate)
     return {
       ...value,
       subtotalCents: totals.subtotalCents,
       discountCents: totals.discountCents,
       vatCents: totals.vatCents,
-      totalCents: totals.totalCents,
+      totalCents: totals.dueCents,
     }
   }
 
   function updateQuote(patch: Partial<Quote>) {
     if (!quote || !data) return
-    setQuote(applyTotals({ ...quote, ...patch }, data))
+    setQuote((current) => {
+      if (!current || current.id !== quote.id) return current
+      const { lines, pricing, discountType, discountValue, ...shared } = patch
+      const optionPatch = {
+        ...(lines !== undefined ? { lines } : {}),
+        ...(pricing !== undefined ? { pricing } : {}),
+        ...(discountType !== undefined ? { discountType } : {}),
+        ...(discountValue !== undefined ? { discountValue } : {}),
+      }
+      const next = current.alternatives?.some((option) => option.id === selectedOptionId)
+        ? { ...current, ...shared, alternatives: (shared.alternatives ?? current.alternatives).map((option) =>
+          option.id === selectedOptionId ? { ...option, ...optionPatch } : option,
+        ) }
+        : { ...current, ...shared, ...optionPatch }
+      return applyTotals(next, data)
+    })
   }
 
   function selectClient(clientId: string) {
     const client = data?.clients.find((item) => item.id === clientId)
-    if (!client || !quote) return
-    updateQuote({ clientId, clientSnapshot: { ...client } })
-  }
-
-  function addItemToQuote(item: CatalogueItem) {
     if (!quote) return
-    setQuote(applyTotals({ ...quote, lines: [...quote.lines, makeLine(item)] }, data!))
+    updateQuote({ clientId: client?.id ?? '', clientSnapshot: client ? { ...client } : blankClient() })
+    setError('')
   }
 
   function addPackageToQuote(item: QuotePackage) {
     if (!quote || !data) return
-    const packageInstanceId = createId()
-    const lines = item.items.flatMap((entry) => {
-      const source = data.catalogue.find((catalogueItem) => catalogueItem.id === entry.itemId)
-      return source
-        ? [{ ...makeLine(source), quantity: entry.quantity, packageId: item.id, packageInstanceId, packageName: item.name }]
-        : []
-    })
-    if (!lines.length) {
-      setError(`The package “${item.name}” has no available catalogue items. Edit the package and try again.`)
-      return
-    }
-    setQuote(applyTotals({ ...quote, lines: [...quote.lines, ...lines] }, data))
+    updateQuote({ lines: [...editingLines, createPackageLine(item, data.catalogue)] })
+    setSection('builder')
   }
 
   async function saveDraft() {
-    if (!quote || !data) return
-    if (!quote.clientId || !quote.clientSnapshot.name.trim()) {
-      if (!data.clients.some((client) => !client.archived)) {
-        setError('Add a client to this quotation, then save the draft.')
-        setEditingClient(null)
-        setModal('client')
-      } else {
-        setError('Select a client before saving this quotation.')
-        document.getElementById('quote-client')?.focus()
-      }
+    if (!quote || !data || busy) return
+    setNotice('')
+    setError('')
+    if (quote.status !== 'Draft') {
+      setError('Open this quotation from Quotation history to save a new draft revision.')
       return
     }
-    if (!quote.lines.length) {
-      setError('Add at least one product or service before saving.')
-      return
-    }
+    setSavingDraft(true)
+    setBusy(true)
     const saved = applyTotals({ ...quote, status: 'Draft' }, data)
     try {
-      await persist(
-        () => saveQuote(saved),
-        'Draft saved',
-        () => {
-          lastAutoSavedQuote.current = JSON.stringify(saved)
-          setData({ ...data, quotations: [saved, ...data.quotations.filter((item) => item.id !== saved.id)] })
-          setQuote(saved)
-          setActiveQuoteId(saved.id)
-        },
-      )
-    } catch {
-      return
+      await saveQuote(saved)
+      lastAutoSavedQuote.current = JSON.stringify(saved)
+      setData((current) => current && { ...current, quotations: [saved, ...current.quotations.filter((item) => item.id !== saved.id)] })
+      setNotice(`Draft ${saved.number} saved. You can reopen it in Quotation history.`)
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause)
+      setError(`Draft could not be saved. ${message}`)
+    } finally {
+      setBusy(false)
+      setSavingDraft(false)
     }
   }
 
   async function generatePdf() {
-    if (!quote || !data) return
-    if (!quote.clientId || !quote.clientSnapshot.name.trim()) {
-      if (!data.clients.some((client) => !client.archived)) {
-        setError('Add a client to this quotation before generating its PDF.')
-        setEditingClient(null)
-        setModal('client')
-      } else {
-        setError('Select a client and make sure their company name is recorded.')
-        document.getElementById('quote-client')?.focus()
-      }
+    if (!quote || !data || busy || quote.status !== 'Draft') return
+    setNotice('')
+    setError('')
+    if (document.querySelector('.quote-workbench [data-image-pending]')) {
+      setError('Wait for the product image to finish importing before exporting.')
       return
     }
-    if (!quote.lines.length || quote.lines.some((line) => line.quantity <= 0 || line.unitPriceCents < 0)) {
-      setError('Add at least one item and check that all quantities and prices are valid.')
+    if (!quote.clientId) {
+      setError('Select or add a client before generating the PDF.')
+      const clientField = data.clients.some((client) => !client.archived) ? 'quote-client' : 'quote-add-client'
+      document.getElementById(clientField)?.focus()
       return
+    }
+    const missing = missingClientFields(quote.clientSnapshot)
+    if (missing.length) {
+      setError(`Complete the required client fields before generating the PDF (${missing.join(', ')}).`)
+      setEditingClient(data.clients.find((client) => client.id === quote.clientId) ?? quote.clientSnapshot)
+      setModal('client')
+      return
+    }
+    const options = quoteOptions(quote)
+    for (const option of options) {
+      const emptyPackage = option.lines.find((line) => line.packageFeatures && !option.lines.some((entry) => !entry.packageFeatures && entry.packageInstanceId === line.packageInstanceId))
+      let problem = ''
+      if (emptyPackage) problem = `Select at least one item in ${emptyPackage.name}.`
+      else if (!option.lines.length) problem = 'Add an item before generating the PDF.'
+      else if (option.lines.some((line) => !line.name.trim() || line.quantity <= 0 || line.quantity < (line.minimumQuantity ?? 0) || line.unitPriceCents < 0)) {
+        problem = 'Check item and feature names, quantities and prices.'
+      }
+      const unavailable = calculateOfferPayments(option, data.settings.vatRate)
+        .find(({ payment, totals }) => payment !== 'cash' && totals.factor === null)
+      if (!problem && unavailable && unavailable.payment !== 'cash') {
+        problem = `${paymentPlanLabel(unavailable.payment)} has no factor for this value. Remove that payment option or update the factors.`
+      }
+      if (problem) {
+        setSelectedOptionId(option.id)
+        setError(`${option.name || 'Offer option'} — ${problem}`)
+        return
+      }
     }
     setBusy(true)
-    setError('')
     try {
       const finalQuote = applyTotals({ ...quote, status: 'Finalised' }, data)
       const { createQuotationPdf, quotationFilename } = await import('./quotationPdf')
-      const document = createQuotationPdf(finalQuote, data.settings)
+      const document = createQuotationPdf(finalQuote, { ...data.settings, preparedBy: currentUser.fullName })
       const filename = quotationFilename(finalQuote)
       const bytes = new Uint8Array(document.output('arraybuffer'))
-      if (isTauri()) {
+      const desktop = isTauri()
+      if (desktop) {
         const path = await join(await downloadDir(), filename)
         await writeFile(path, bytes)
-        const savedQuote = { ...finalQuote, exportedFilename: filename }
-        await saveQuote(savedQuote)
-        setQuote(savedQuote)
-        setData({ ...data, quotations: [savedQuote, ...data.quotations.filter((item) => item.id !== savedQuote.id)] })
-        setActiveQuoteId(savedQuote.id)
-        setGeneratedPdf({ url: URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' })), filename, quote: savedQuote })
-        setPdfViewerOpen(true)
-        setNotice('PDF saved to Downloads and quotation finalised.')
       } else {
         document.save(filename)
-        const savedQuote = { ...finalQuote, exportedFilename: filename }
-        await saveQuote(savedQuote)
-        setQuote(savedQuote)
-        setData({ ...data, quotations: [savedQuote, ...data.quotations.filter((item) => item.id !== savedQuote.id)] })
-        setActiveQuoteId(savedQuote.id)
-        setGeneratedPdf({ url: URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' })), filename, quote: savedQuote })
-        setPdfViewerOpen(true)
-        setNotice('PDF downloaded and quotation finalised.')
       }
+      const savedQuote = { ...finalQuote, exportedFilename: filename }
+      await saveQuote(savedQuote)
+      setQuote((current) => current?.id === savedQuote.id ? savedQuote : current)
+      setData((current) => current && { ...current, quotations: [savedQuote, ...current.quotations.filter((item) => item.id !== savedQuote.id)] })
+      setActiveQuoteId(savedQuote.id)
+      setGeneratedPdf({ url: URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' })), filename, quote: savedQuote })
+      setPdfViewerOpen(true)
+      setNotice(desktop ? 'PDF saved to Downloads and quotation finalised.' : 'PDF downloaded and quotation finalised.')
     } catch (cause) {
-      setError(cause instanceof Error ? `PDF export failed: ${cause.message}` : 'PDF export failed.')
+      const message = cause instanceof Error ? cause.message : String(cause)
+      setError(`PDF export failed. ${message}`)
     } finally {
       setBusy(false)
     }
   }
 
-  async function saveClientForm(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
+  async function saveClientForm(client: Client) {
     if (!data) return
-    const form = new FormData(event.currentTarget)
-    const client: Client = {
-      ...(editingClient ?? blankClient()),
-      name: String(form.get('name') ?? '').trim(),
-      contact: String(form.get('contact') ?? '').trim(),
-      email: String(form.get('email') ?? '').trim(),
-      phone: String(form.get('phone') ?? '').trim(),
-      address: String(form.get('address') ?? '').trim(),
-      city: String(form.get('city') ?? '').trim(),
-      province: String(form.get('province') ?? '').trim(),
-      postalCode: String(form.get('postalCode') ?? '').trim(),
-      vatNumber: String(form.get('vatNumber') ?? '').trim(),
-    }
     try {
       await persist(
         () => saveClient(client),
@@ -509,16 +557,46 @@ function App() {
     }
   }
 
+  async function saveManagedPackage(item: QuotePackage, message: string, onSaved?: () => void) {
+    if (busy) return
+    setBusy(true)
+    try {
+      await persist(() => savePackage(item), message, () => {
+        setData((current) => current ? { ...current, packages: current.packages.some((entry) => entry.id === item.id)
+          ? current.packages.map((entry) => entry.id === item.id ? item : entry)
+          : [item, ...current.packages] } : current)
+        setManagedPackageId(item.id)
+        onSaved?.()
+      })
+    } catch {
+      // The editor stays open with the save error.
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function saveItemForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!data) return
+    if (event.currentTarget.querySelector('[data-image-pending]')) {
+      setError('Wait for the product image to finish importing.')
+      return
+    }
     const form = new FormData(event.currentTarget)
+    const parent = data.packages.find((entry) => entry.id === productPackageId)
+    if (productPackageId && !parent) return
+    if (editingItem?.pricingPending && !String(form.get('price') ?? '').trim()) {
+      setError('Enter a confirmed once-off price, or enter zero for a monthly-only product.')
+      return
+    }
     const item: CatalogueItem = {
       ...(editingItem ?? blankCatalogueItem()),
       name: String(form.get('name') ?? '').trim(),
       description: String(form.get('description') ?? '').trim(),
       sku: String(form.get('sku') ?? '').trim(),
-      category: String(form.get('category') ?? '').trim() || 'General',
+      category: parent ? packageCategory(parent, data.catalogue) : 'General',
+      productGroup: String(form.get('productGroup') ?? '').trim() || undefined,
+      choiceGroup: accessoryParent ? String(form.get('choiceGroup') ?? '').trim() || undefined : editingItem?.choiceGroup,
       unit: String(form.get('unit') ?? '').trim() || 'each',
       priceCents: catalogueNetPriceCents(
         centsFromInput(String(form.get('price') ?? '0')),
@@ -526,66 +604,83 @@ function App() {
         form.get('vatApplicable') === 'on',
         data.settings.vatRate,
       ),
+      costCents: form.get('cost') ? centsFromInput(String(form.get('cost'))) : undefined,
+      monthlyCents: catalogueNetPriceCents(
+        centsFromInput(String(form.get('monthly') ?? 0)),
+        form.get('priceIncludesVat') === 'on',
+        form.get('vatApplicable') === 'on',
+        data.settings.vatRate,
+      ),
+      imageDataUrl: String(form.get('imageDataUrl') ?? '') || undefined,
       vatApplicable: form.get('vatApplicable') === 'on',
+      pricingPending: undefined,
       active: true,
     }
     if (form.get('pricingType') === 'hourly') item.unit = 'hour'
-    const saveToCatalogue = form.get('saveToCatalogue') !== 'off'
-    try {
-      await persist(
-        () => saveToCatalogue ? saveCatalogueItem(item) : Promise.resolve(),
-        editingItem ? 'Catalogue item updated' : saveToCatalogue ? 'Catalogue item added' : 'Item added to quotation',
-        () => {
-          if (saveToCatalogue) {
-            setData({ ...data, catalogue: [item, ...data.catalogue.filter((entry) => entry.id !== item.id)] })
-          }
-          if (quote) addItemToQuote(item)
-          setModal(null)
-          setEditingItem(null)
-        },
-      )
-    } catch {
+    if (!item.name) {
+      setError(accessoryParent ? 'Enter a feature name.' : 'Enter a product or service name.')
       return
+    }
+    const closeItemEditor = () => {
+      setModal(null)
+      setEditingItem(null)
+      setProductPackageId(null)
+      setAccessoryParent(null)
+    }
+    if (parent && accessoryParent) {
+      const product = packageProducts(parent, data.catalogue).find(({ item }) => item.id === accessoryParent.id)?.item
+      if (!product || !supportsProductAccessories(packageCategory(parent, data.catalogue))) {
+        setError('Select an Office Automation product to manage its features.')
+        return
+      }
+      const accessories = productAccessories(product, data.catalogue)
+      const updated = editingItem ? accessories.map((entry) => entry.id === editingItem.id ? item : entry) : [...accessories, item]
+      await saveManagedPackage(withProductAccessories(parent, product, updated), editingItem ? 'Feature updated' : 'Feature added', closeItemEditor)
+    } else if (parent) {
+      const entry = { itemId: item.id, quantity: Math.max(item.minimumQuantity ?? 0.01, Number(form.get('quantity')) || 1), product: item }
+      const items = editingItem
+        ? parent.items.map((existing) => existing.itemId === editingItem.id ? entry : existing)
+        : [...parent.items, entry]
+      await saveManagedPackage({ ...parent, items }, editingItem ? 'Product updated' : 'Product added to package', closeItemEditor)
+    } else if (quote && section === 'builder') {
+      updateQuote({ lines: [...editingLines, { ...makeLine(item), itemId: null }] })
+      setNotice('Item added to quotation')
+      closeItemEditor()
     }
   }
 
   async function savePackageForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!data) return
-    const form = new FormData(event.currentTarget)
-    const itemIds = form.getAll('itemIds').map(String).filter(Boolean)
-    if (!itemIds.length) {
-      setError('Select at least one product or service for this package.')
+    if (event.currentTarget.querySelector('[data-image-pending]')) {
+      setError('Wait for the package image to finish importing.')
       return
     }
+    const form = new FormData(event.currentTarget)
     const entry: QuotePackage = {
-      id: createId(),
+      id: editingPackage?.id ?? createId(),
       name: String(form.get('name') ?? '').trim(),
       description: String(form.get('description') ?? '').trim(),
-      items: itemIds.map((itemId) => ({
-        itemId,
-        quantity: Math.max(1, Number(form.get('quantity')) || 1),
-      })),
+      category: String(form.get('category') ?? '').trim() || undefined,
+      imageDataUrl: String(form.get('imageDataUrl') ?? '') || undefined,
+      items: editingPackage?.items ?? [],
     }
-    try {
-      await persist(
-        () => savePackage(entry),
-        'Package created',
-        () => {
-          setData({ ...data, packages: [entry, ...data.packages] })
-          setModal(null)
-        },
-      )
-    } catch {
+    if (!entry.name) {
+      setError('Enter a package name.')
       return
     }
+    await saveManagedPackage(entry, editingPackage ? 'Package updated' : 'Package created', () => {
+      setEditingPackage(null)
+      setModal(null)
+    })
   }
 
   async function saveQuoteTemplateForm(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!data) return
     const form = new FormData(event.currentTarget)
-    const source = data.quotations.find((item) => item.id === String(form.get('quoteId') ?? ''))
+    const sourceId = String(form.get('quoteId') ?? '')
+    const source = section === 'builder' && quote?.id === sourceId ? quote : data.quotations.find((item) => item.id === sourceId)
     if (!source) {
       setError('Choose a saved quotation to use as the template starting point.')
       return
@@ -594,7 +689,7 @@ function App() {
       id: createId(),
       name: String(form.get('name') ?? '').trim(),
       description: String(form.get('description') ?? '').trim(),
-      quote: structuredClone(source),
+      quote: structuredClone({ ...source, details: undefined }),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }
@@ -633,7 +728,16 @@ function App() {
     event.preventDefault()
     if (!data) return
     const form = new FormData(event.currentTarget)
+    const paymentPlans = JSON.parse(String(form.get('paymentPlans') ?? '[]')) as PaymentPlan[]
+    if (paymentPlans.some((plan) => !Number.isInteger(plan.months) || plan.months < 1 ||
+      !Number.isFinite(plan.escalation) || plan.escalation < 0 || !plan.tiers.length ||
+      plan.tiers.some((tier, index) => !Number.isFinite(tier.factor) || tier.factor < 0 ||
+        !Number.isFinite(tier.limit) || tier.limit <= (plan.tiers[index - 1]?.limit ?? 0)))) {
+      setError('Check the term, escalation and factors. Each plan needs thresholds in increasing order.')
+      return
+    }
     const settings: CompanySettings = {
+      paymentPlans,
       name: String(form.get('name') ?? '').trim(),
       logoDataUrl: String(form.get('logoDataUrl') ?? ''),
       registrationNumber: String(form.get('registrationNumber') ?? '').trim(),
@@ -662,12 +766,37 @@ function App() {
     )
   }
 
-  function applySelectedPackage(packageId: string) {
-    const item = data?.packages.find((entry) => entry.id === packageId)
-    if (item) addPackageToQuote(item)
+  async function exportHistoryReport(quotes: Quote[], type: ReportType, format: 'xlsx' | 'csv') {
+    if (!data) return
+    setError('')
+    try {
+      const bytes = format === 'xlsx'
+        ? quotationWorkbook(quotes, type, data.settings.vatRate)
+        : new TextEncoder().encode(quotationReport(quotes, type, data.settings.vatRate))
+      const filename = `Techspire-${type.toLowerCase().replaceAll(' ', '-')}-${today()}.${format}`
+      if (isTauri()) {
+        const path = await save({ defaultPath: filename, filters: [{ name: format === 'xlsx' ? 'Excel workbook' : 'CSV report', extensions: [format] }] })
+        if (!path) return
+        await writeFile(path, bytes)
+      } else {
+        const mimeType = format === 'xlsx'
+          ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          : 'text/csv;charset=utf-8'
+        const url = URL.createObjectURL(new Blob([Uint8Array.from(bytes)], { type: mimeType }))
+        const link = document.createElement('a')
+        link.href = url
+        link.download = filename
+        link.click()
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+      }
+      setNotice(`${type} report exported.`)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not export the quotation report.')
+    }
   }
 
   async function exportBackup() {
+    if (!canAccessSection(currentUser, 'backup')) return
     setError('')
     try {
       const bytes = await exportDatabase()
@@ -696,98 +825,34 @@ function App() {
   }
 
   async function importBackup() {
+    if (!canAccessSection(currentUser, 'backup')) return
     setError('')
     try {
       let bytes: Uint8Array
       if (isTauri()) {
-        const path = await open({ multiple: false, filters: [{ name: 'SQLite database', extensions: ['sqlite', 'db'] }] })
+        const path = await open({ multiple: false, filters: [{ name: 'Techspire backups', extensions: ['sqlite', 'sqlite3', 'db', 'zip'] }] })
         if (!path || Array.isArray(path)) return
         bytes = await readFile(path)
       } else {
         const input = document.createElement('input')
         input.type = 'file'
-        input.accept = '.sqlite,.db'
-        input.click()
+        input.accept = '.sqlite,.sqlite3,.db,.zip'
         const file = await new Promise<File | null>((resolve) => {
           input.onchange = () => resolve(input.files?.[0] ?? null)
           input.oncancel = () => resolve(null)
+          input.click()
         })
         if (!file) return
         bytes = new Uint8Array(await file.arrayBuffer())
       }
+      const warning = 'Restoring this backup replaces your current local quotation data. Continue?'
+      const confirmed = isTauri() ? await confirm(warning, { title: 'Restore backup', kind: 'warning' }) : window.confirm(warning)
+      if (!confirmed) return
       await restoreDatabase(bytes)
       setData(await loadAppData())
       setNotice('Database restored.')
     } catch (cause) {
       setError(cause instanceof Error ? `Restore failed: ${cause.message}` : 'Restore failed.')
-    }
-  }
-
-  async function exportCatalogueCsv() {
-    if (!data) return
-    const quoteCsv = (value: string) => `"${value.replaceAll('"', '""')}"`
-    const lines = [
-      ['Name', 'Description', 'SKU', 'Category', 'Unit', 'Price ex VAT (ZAR)', 'VAT applicable'].join(','),
-      ...data.catalogue.map((item) =>
-        [
-          item.name,
-          item.description,
-          item.sku,
-          item.category,
-          item.unit,
-          (item.priceCents / 100).toFixed(2),
-          item.vatApplicable ? 'Yes' : 'No',
-        ]
-          .map(quoteCsv)
-          .join(','),
-      ),
-    ]
-    const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = 'Techspire-Catalogue.csv'
-    anchor.click()
-    URL.revokeObjectURL(url)
-  }
-
-  async function importCatalogueCsv(file: File) {
-    if (!data) return
-    setError('')
-    try {
-      const rows = parseCsv(await file.text())
-      const headers = rows[0]?.map((value) => value.trim().toLowerCase()) ?? []
-      const requiredHeaders = ['name', 'description', 'sku', 'category', 'unit', 'price ex vat (zar)', 'vat applicable']
-      if (requiredHeaders.some((header) => !headers.includes(header))) {
-        throw new Error('CSV headers must match the exported catalogue format.')
-      }
-      const parsed = rows.slice(1).map((columns, rowIndex) => {
-        const get = (header: string) => columns[headers.indexOf(header)]?.trim() ?? ''
-        const priceText = get('price ex vat (zar)')
-        const price = Number(priceText)
-        if (!get('name') || !priceText || !Number.isFinite(price) || price < 0) {
-          throw new Error(`CSV row ${rowIndex + 2} needs an item name and a valid non-negative price.`)
-        }
-        const vat = get('vat applicable').toLowerCase()
-        if (vat && !['yes', 'no'].includes(vat)) {
-          throw new Error(`CSV row ${rowIndex + 2} VAT applicability must be Yes or No.`)
-        }
-        return {
-          ...blankCatalogueItem(),
-          name: get('name'),
-          description: get('description'),
-          sku: get('sku'),
-          category: get('category') || 'General',
-          unit: get('unit') || 'each',
-          priceCents: centsFromInput(price),
-          vatApplicable: vat !== 'no',
-        }
-      })
-      await saveCatalogueItems(parsed)
-      setData({ ...data, catalogue: [...parsed, ...data.catalogue] })
-      setNotice(`${parsed.length} catalogue item${parsed.length === 1 ? '' : 's'} imported.`)
-    } catch (cause) {
-      setError(cause instanceof Error ? `CSV import failed: ${cause.message}` : 'CSV import failed.')
     }
   }
 
@@ -842,19 +907,22 @@ function App() {
     )
   }
 
-  const filteredCatalogue = data.catalogue.filter((item) => {
-    const matchesSearch = `${item.name} ${item.description} ${item.sku} ${item.category}`.toLowerCase().includes(search.toLowerCase())
-    return matchesSearch && item.active && (catalogueFilter === 'All categories' || item.category === catalogueFilter)
-  })
-  const categories = ['All categories', ...new Set(data.catalogue.map((item) => item.category).filter(Boolean))]
   const filteredClients = data.clients.filter((client) =>
     `${client.name} ${client.contact} ${client.email}`.toLowerCase().includes(search.toLowerCase()),
   )
-  const filteredQuotes = data.quotations.filter((item) => {
-    const matchesText = `${item.number} ${item.clientSnapshot.name} ${item.title}`.toLowerCase().includes(search.toLowerCase())
-    const matchesStatus = historyFilter === 'All statuses' || item.status === historyFilter
-    return matchesText && matchesStatus
-  })
+  const historyCreators = [...new Set(data.quotations.map((item) => item.createdBy?.trim()).filter((value): value is string => Boolean(value)))].sort((a, b) => a.localeCompare(b))
+  const filteredQuotes = filterQuoteHistory(data.quotations, search, historyFilter, historyCreatorFilter, historyDateRange.from, historyDateRange.to)
+  const ownerName = currentUser.fullName.trim()
+  const hasUniqueOwnerName = users.filter((user) => user.fullName.trim() === ownerName).length === 1
+  const myQuotes = hasUniqueOwnerName ? filterMyQuotes(data.quotations, ownerName, '', 'All statuses') : []
+  const myQuoteCount = myQuotes.length
+  const filteredMyQuotes = filterMyQuotes(myQuotes, ownerName, myQuotesSearch, myQuotesFilter, myQuotesDateRange.from, myQuotesDateRange.to)
+  const errorAlert = error && (
+    <div className="alert alert-error" role="alert">
+      <ShieldCheck size={17} /><span>{error}</span>
+      <button aria-label="Dismiss error" onClick={() => setError('')}><X size={15} /></button>
+    </div>
+  )
 
   return (
     <div className="app-shell">
@@ -865,10 +933,15 @@ function App() {
         </button>
         <div className="workspace-pill"><span className="workspace-dot" /> Local workspace <ChevronDown size={14} /></div>
         <nav className="nav-list" aria-label="Main navigation">
-          {(['main', 'manage', 'system'] as const).map((group) => (
+          {(['main', 'manage', 'system'] as const).map((group) => {
+            const entries = navigation.filter((item) => item.group === group && canAccessSection(currentUser, item.section))
+            if (!entries.length) return null
+            return (
             <div className="nav-group" key={group}>
-              <span className="nav-label">{group === 'main' ? 'WORKSPACE' : group === 'manage' ? 'MANAGE' : 'PREFERENCES'}</span>
-              {navigation.filter((item) => item.group === group).map(({ label, section: target, icon: Icon }) => (
+              {(group !== 'system' || currentUser.role === 'admin') && (
+                <span className="nav-label">{group === 'main' ? 'WORKSPACE' : group === 'manage' ? 'MANAGE' : 'PREFERENCES'}</span>
+              )}
+              {entries.map(({ label, section: target, icon: Icon }) => (
                 <button
                   className={`nav-item ${section === target ? 'active' : ''}`}
                   key={target}
@@ -879,10 +952,12 @@ function App() {
                 >
                   <Icon size={17} strokeWidth={1.8} /><span>{label}</span>
                   {target === 'history' && data.quotations.length > 0 && <span className="nav-count">{data.quotations.length}</span>}
+                  {target === 'my-quotes' && myQuoteCount > 0 && <span className="nav-count">{myQuoteCount}</span>}
                 </button>
               ))}
             </div>
-          ))}
+            )
+          })}
         </nav>
         <div className="sidebar-footer">
           <div className="offline-indicator"><span className="workspace-dot" /><span><b>Offline ready</b><small>Your data stays on this device</small></span></div>
@@ -896,75 +971,79 @@ function App() {
           <div className="topbar-right">
             <span className="topbar-date">{displayDate}</span>
             <button className="icon-button" aria-label="Notifications" onClick={() => setNotice('You’re all caught up.')}><Bell size={18} /></button>
-            <div className="avatar">{(data.settings.preparedBy || data.settings.name).slice(0, 1).toUpperCase()}</div>
+            <div className="avatar">{currentUser.fullName.slice(0, 1).toUpperCase()}</div>
           </div>
         </header>
 
         <div className="page-content">
-          {error && <div className="alert alert-error"><ShieldCheck size={17} /><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={15} /></button></div>}
-          {notice && <div className="alert alert-success"><Check size={17} /><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice('')}><X size={15} /></button></div>}
+          {((error && !modal) || notice) && <div className={section === 'builder' ? 'quote-feedback' : undefined}>
+            {!modal && errorAlert}
+            {notice && <div className="alert alert-success" role="status"><Check size={17} /><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice('')}><X size={15} /></button></div>}
+          </div>}
 
-          {section === 'dashboard' && (
+          {!canAccessSection(currentUser, section) && <div className="panel access-denied"><ShieldCheck size={22} /><h2>Page unavailable</h2><p>Your account does not have access to this page. Contact an administrator if you need access.</p></div>}
+          {section === 'dashboard' && canAccessSection(currentUser, section) && (
             <Dashboard
-              data={data}
+              quotations={currentUser.role === 'admin' ? data.quotations : myQuotes}
+              currentUser={currentUser}
               onNew={startNewQuote}
               onOpenQuote={openQuote}
               onNavigate={setSection}
-              onManageProducts={() => setSection('catalogue')}
+              onManageProducts={() => setSection('packages')}
             />
           )}
 
-          {section === 'builder' && quote && (
+          {section === 'builder' && canAccessSection(currentUser, 'builder') && quote && quote.status !== 'Draft' && (
+            <>
+              <div className="page-heading heading-split">
+                <div><div className="eyebrow">{quote.number} · {quote.status}</div><h1>{quote.title}</h1><p>Saved quotation preview</p></div>
+                <div className="heading-actions">
+                  <button className="button button-secondary" onClick={() => duplicateQuote(quote)}><Copy size={16} /> Duplicate as draft</button>
+                </div>
+              </div>
+              <PdfPreview quote={quote} settings={{ ...data.settings, preparedBy: quote.createdBy || data.settings.preparedBy }} large />
+            </>
+          )}
+          {section === 'builder' && canAccessSection(currentUser, 'builder') && quote?.status === 'Draft' && (
             <Builder
               data={data}
               quote={quote}
+              currentUser={currentUser}
+              selectedOptionId={editingOption?.id ?? ''}
+              onSelectOption={setSelectedOptionId}
               existingQuote={activeQuote}
               generatedPdf={generatedPdf?.quote.id === quote.id ? generatedPdf : null}
               onViewGeneratedPdf={() => setPdfViewerOpen(true)}
               busy={busy}
+              savingDraft={savingDraft}
               onUpdate={updateQuote}
               onSelectClient={selectClient}
-              onAddItem={addItemToQuote}
               onSaveDraft={saveDraft}
               onGeneratePdf={generatePdf}
               onAddClient={() => {
+                setError('')
                 setEditingClient(null)
                 setModal('client')
               }}
               onEditClient={(client) => {
+                setError('')
                 setEditingClient(client)
                 setModal('client')
               }}
               onAddItemForm={() => {
+                setError('')
                 setEditingItem(null)
                 setModal('item')
               }}
-              onApplyPackage={applySelectedPackage}
+              onUseTemplate={startQuoteFromTemplate}
+              onSaveTemplate={() => {
+                setError('')
+                setModal('quote-template')
+              }}
             />
           )}
 
-          {section === 'catalogue' && (
-            <CataloguePage
-              items={filteredCatalogue}
-              categories={categories}
-              filter={catalogueFilter}
-              search={search}
-              onSearch={setSearch}
-              onFilter={setCatalogueFilter}
-              onAdd={() => {
-                setEditingItem(null)
-                setModal('item')
-              }}
-              onEdit={(item) => {
-                setEditingItem(item)
-                setModal('item')
-              }}
-              onExport={exportCatalogueCsv}
-              onImport={importCatalogueCsv}
-            />
-          )}
-
-          {section === 'clients' && (
+          {section === 'clients' && canAccessSection(currentUser, 'clients') && (
             <ClientsPage
               clients={filteredClients}
               search={search}
@@ -978,7 +1057,7 @@ function App() {
                 setModal('client')
               }}
               onArchive={async (client) => {
-                if (!window.confirm(`Archive ${client.name}? Existing quotations will remain unchanged.`)) return
+                if (!window.confirm(`Archive ${clientDisplayName(client)}? Existing quotations will remain unchanged.`)) return
                 const archived = { ...client, archived: true }
                 try {
                   await persist(() => saveClient(archived), 'Client archived', () =>
@@ -989,42 +1068,83 @@ function App() {
             />
           )}
 
-          {section === 'history' && (
+          {section === 'history' && canAccessSection(currentUser, 'history') && (
             <HistoryPage
               quotes={filteredQuotes}
+              scope="all"
               search={search}
               status={historyFilter}
+              creator={historyCreatorFilter}
+              creators={historyCreators}
+              dateRange={historyDateRange}
+              onDateRange={setHistoryDateRange}
               onSearch={setSearch}
               onStatus={setHistoryFilter}
+              onCreator={setHistoryCreatorFilter}
               onOpen={openQuote}
+              onExport={exportHistoryReport}
               onStatusChange={updateQuoteStatus}
-              onDuplicate={(item) => {
-                setQuote({
-                  ...structuredClone(item),
-                  id: createId(),
-                  number: quoteNumber(data, quote),
-                  status: 'Draft',
-                  issueDate: today(),
-                  validUntil: dateAfter(today(), data.settings.validityDays),
-                  createdAt: new Date().toISOString(),
-                  exportedFilename: '',
-                })
-                setActiveQuoteId(null)
-                setSection('builder')
-              }}
+              onDuplicate={duplicateQuote}
             />
           )}
 
-          {section === 'packages' && (
-            <PackagesPage
-              packages={data.packages}
-              catalogue={data.catalogue}
-              onAdd={() => setModal('package')}
+          {section === 'my-quotes' && canAccessSection(currentUser, 'my-quotes') && (
+            <HistoryPage
+              quotes={filteredMyQuotes}
+              scope="mine"
+              search={myQuotesSearch}
+              status={myQuotesFilter}
+              creator={currentUser.fullName}
+              creators={[]}
+              dateRange={myQuotesDateRange}
+              onDateRange={setMyQuotesDateRange}
+              onSearch={setMyQuotesSearch}
+              onStatus={setMyQuotesFilter}
+              onCreator={() => {}}
+              onOpen={openQuote}
+              onExport={exportHistoryReport}
+              onStatusChange={updateQuoteStatus}
+              onNew={startNewQuote}
+              onDuplicate={duplicateQuote}
+            />
+          )}
+
+          {section === 'packages' && canAccessSection(currentUser, 'packages') && (
+            <PackagesPage packages={data.packages} legacyProducts={data.catalogue} selectedId={managedPackageId} busy={busy}
+              onSelect={setManagedPackageId}
+              onAdd={() => { setEditingPackage(null); setModal('package') }}
+              onEdit={(item) => { setEditingPackage(item); setModal('package') }}
               onAddToQuote={(item) => quote ? addPackageToQuote(item) : startQuoteWithPackage(item)}
-            />
+              onProduct={(parent, product) => {
+                setAccessoryParent(null)
+                setProductPackageId(parent.id)
+                setEditingItem(product ?? null)
+                setModal('item')
+              }}
+              onAccessory={(parent, product, accessory) => {
+                if (!supportsProductAccessories(packageCategory(parent, data.catalogue))) return
+                setAccessoryParent(product)
+                setProductPackageId(parent.id)
+                setEditingItem(accessory ?? null)
+                setModal('item')
+              }}
+              onRemoveAccessory={(parent, product, accessory) => {
+                if (!supportsProductAccessories(packageCategory(parent, data.catalogue))) return
+                if (!window.confirm(`Remove "${accessory.name}" from "${product.name}"?`)) return
+                const remaining = productAccessories(product, data.catalogue).filter((entry) => entry.id !== accessory.id)
+                void saveManagedPackage(withProductAccessories(parent, product, remaining), 'Feature removed')
+              }}
+              onCopyProduct={(parent, source) => {
+                const product = { ...source, id: createId(), active: true, category: packageCategory(parent, data.catalogue) }
+                void saveManagedPackage({ ...parent, items: [...parent.items, { itemId: product.id, quantity: 1, product }] }, 'Product copied into package')
+              }}
+              onRemoveProduct={(parent, product) => {
+                if (!window.confirm(`Remove "${product.name}" from "${parent.name}"?`)) return
+                void saveManagedPackage({ ...parent, items: parent.items.filter((item) => item.itemId !== product.id) }, 'Product removed from package')
+              }} />
           )}
 
-          {section === 'templates' && (
+          {section === 'templates' && canAccessSection(currentUser, 'templates') && (
             <QuoteTemplatesPage
               templates={data.quoteTemplates}
               quotations={data.quotations}
@@ -1034,8 +1154,9 @@ function App() {
             />
           )}
 
-          {section === 'settings' && <SettingsPage settings={data.settings} onSave={saveSettingsForm} />}
-          {section === 'backup' && <BackupPage onExport={exportBackup} onImport={importBackup} />}
+          {section === 'settings' && canAccessSection(currentUser, 'settings') && <SettingsPage settings={data.settings} onSave={saveSettingsForm} />}
+          {section === 'backup' && canAccessSection(currentUser, 'backup') && <BackupPage onExport={exportBackup} onImport={importBackup} />}
+          {section === 'users' && currentUser.role === 'admin' && <UsersPage users={users} currentUserId={currentUser.id} onSaveUsers={onSaveUsers} />}
         </div>
       </main>
 
@@ -1045,26 +1166,31 @@ function App() {
             modal === 'client'
               ? editingClient ? 'Edit client' : 'Add a client'
               : modal === 'item'
-                ? editingItem ? 'Edit catalogue item' : 'Add a catalogue item'
-                : modal === 'package' ? 'Create a package' : 'Create a reusable quotation template'
+                ? accessoryParent ? editingItem ? 'Edit feature' : 'Add feature' :
+                  productPackageId ? editingItem ? 'Edit package product' : 'Add product to package' : 'Add a custom item'
+                : modal === 'package' ? editingPackage ? 'Edit package' : 'Create a package' : 'Create a reusable quotation template'
           }
           onClose={() => {
             setModal(null)
             setEditingClient(null)
             setEditingItem(null)
+            setProductPackageId(null)
+            setAccessoryParent(null)
           }}
         >
+          {errorAlert}
           {modal === 'client' && (
-            <ClientForm client={editingClient} onSubmit={saveClientForm} />
+            <ClientForm client={editingClient} busy={busy} onCancel={() => { setModal(null); setError('') }} onSubmit={saveClientForm} />
           )}
           {modal === 'item' && (
-            <CatalogueForm item={editingItem} allowTransient={section === 'builder' && !editingItem} onSubmit={saveItemForm} />
+            <ProductForm item={editingItem} accessoryParent={accessoryParent} parent={data.packages.find((entry) => entry.id === productPackageId)}
+              legacyProducts={data.catalogue} busy={busy} onSubmit={saveItemForm} />
           )}
           {modal === 'package' && (
-            <PackageForm catalogue={data.catalogue} onSubmit={savePackageForm} />
+            <PackageForm categories={catalogueCategories(data.catalogue)} headings={data.packages.map((item) => packageCategory(item, data.catalogue))} busy={busy} item={editingPackage} onSubmit={savePackageForm} />
           )}
           {modal === 'quote-template' && (
-            <QuoteTemplateForm quotations={data.quotations} onSubmit={saveQuoteTemplateForm} />
+            <QuoteTemplateForm quotations={section === 'builder' && quote ? [quote, ...data.quotations.filter((entry) => entry.id !== quote.id)] : data.quotations} onSubmit={saveQuoteTemplateForm} />
           )}
         </Modal>
       )}
@@ -1082,7 +1208,7 @@ function App() {
                 <button className="icon-button" aria-label="Close PDF preview" onClick={() => setPdfViewerOpen(false)}><X size={19} /></button>
               </div>
             </header>
-            <PdfPreview quote={generatedPdf.quote} settings={data.settings} large />
+            <PdfPreview quote={generatedPdf.quote} settings={{ ...data.settings, preparedBy: currentUser.fullName }} large />
             <iframe id="generated-pdf-frame" className="pdf-print-frame" title={`Print source for ${generatedPdf.filename}`} src={generatedPdf.url} />
           </section>
         </div>
@@ -1092,25 +1218,29 @@ function App() {
 }
 
 function Dashboard({
-  data,
+  quotations,
+  currentUser,
   onNew,
   onOpenQuote,
   onNavigate,
   onManageProducts,
 }: {
-  data: AppData
+  quotations: Quote[]
+  currentUser: UserProfile
   onNew: () => void
   onOpenQuote: (quote: Quote) => void
   onNavigate: (section: Section) => void
   onManageProducts: () => void
 }) {
   const statuses: QuoteStatus[] = ['Draft', 'Finalised', 'Sent', 'Accepted', 'Rejected', 'Expired']
-  const counts = statuses.map((status) => data.quotations.filter((quote) => quote.status === status).length)
+  const counts = statuses.map((status) => quotations.filter((quote) => quote.status === status).length)
+  const historySection = currentUser.role === 'admin' ? 'history' : 'my-quotes'
+  const canBuild = canAccessSection(currentUser, 'builder')
   const month = today().slice(0, 7)
-  const thisMonth = data.quotations.filter((quote) => quote.createdAt.slice(0, 7) === month).length
-  const total = data.quotations.reduce((sum, quote) => sum + quote.totalCents, 0)
+  const thisMonth = quotations.filter((quote) => quote.createdAt.slice(0, 7) === month).length
+  const total = quotations.reduce((sum, quote) => sum + quote.totalCents, 0)
   const cards = [
-    { label: 'Total quotations', value: String(data.quotations.length), icon: FileText, tint: 'red' },
+    { label: 'Total quotations', value: String(quotations.length), icon: FileText, tint: 'red' },
     { label: 'Drafts in progress', value: String(counts[0]), icon: ClipboardList, tint: 'amber' },
     { label: 'Accepted', value: String(counts[3]), icon: BadgeCheck, tint: 'green' },
     { label: 'Created this month', value: String(thisMonth), icon: BarChart3, tint: 'blue' },
@@ -1118,8 +1248,8 @@ function Dashboard({
   return (
     <>
       <div className="page-heading heading-split">
-        <div><div className="eyebrow">OVERVIEW</div><h1>Good day{data.settings.preparedBy ? `, ${data.settings.preparedBy.split(' ')[0]}` : ''}.</h1><p>Here’s what’s happening with your quotations.</p></div>
-        <button className="button button-primary" onClick={onNew}><Plus size={17} /> New quotation</button>
+        <div><div className="eyebrow">OVERVIEW</div><h1>Good day, {currentUser.fullName.split(' ')[0]}.</h1><p>Here’s what’s happening with your quotations.</p></div>
+        {canBuild && <button className="button button-primary" onClick={onNew}><Plus size={17} /> New quotation</button>}
       </div>
       <div className="stat-grid">
         {cards.map(({ label, value, icon: Icon, tint }) => <div className="stat-card" key={label}>
@@ -1128,26 +1258,26 @@ function Dashboard({
       </div>
       <section className="dashboard-row">
         <div className="panel recent-panel">
-          <div className="panel-heading"><div><h2>Recent quotations</h2><p>Your latest activity at a glance.</p></div><button className="text-button" onClick={() => onNavigate('history')}>View all <ArrowRight size={14} /></button></div>
-          {data.quotations.length ? <div className="table-wrap">
-            <table><thead><tr><th>QUOTE</th><th>CLIENT</th><th>STATUS</th><th className="align-right">TOTAL INCL. VAT</th></tr></thead>
-              <tbody>{data.quotations.slice(0, 5).map((quote) => <tr key={quote.id} onClick={() => onOpenQuote(quote)}>
-                <td><b>{quote.number}</b><small>{quote.title}</small></td><td>{quote.clientSnapshot.name || 'No client'}</td><td><span className={statusTone(quote.status)}>{quote.status}</span></td><td className="align-right amount">{money(quote.totalCents)}</td>
+          <div className="panel-heading"><div><h2>Recent quotations</h2><p>Your latest activity at a glance.</p></div>{canAccessSection(currentUser, historySection) && <button className="text-button" onClick={() => onNavigate(historySection)}>View all <ArrowRight size={14} /></button>}</div>
+          {quotations.length ? <div className="table-wrap">
+            <table><thead><tr><th>QUOTE</th><th>CLIENT</th><th>CREATED BY</th><th>STATUS</th><th className="align-right">TOTAL INCL. VAT</th></tr></thead>
+              <tbody>{quotations.slice(0, 5).map((quote) => <tr key={quote.id} onClick={canBuild ? () => onOpenQuote(quote) : undefined}>
+                <td><b>{quote.number}</b><small>{quote.title}</small></td><td>{clientDisplayName(quote.clientSnapshot) || 'No client'}</td><td>{quote.createdBy || 'Not recorded'}</td><td><span className={statusTone(quote.status)}>{quote.status}</span></td><td className="align-right amount">{money(quote.totalCents)}</td>
               </tr>)}</tbody>
             </table>
-          </div> : <EmptyState title="Your first quotation starts here" text="Add a client and choose your products to create a polished PDF." action="Create quotation" onAction={onNew} />}
+          </div> : <EmptyState title="Your first quotation starts here" text="Add a client and choose your products to create a polished PDF." action={canBuild ? 'Create quotation' : undefined} onAction={onNew} />}
         </div>
         <div className="panel quick-panel">
           <div className="panel-heading"><div><h2>Quick actions</h2><p>Keep the work moving.</p></div><Sparkles size={17} className="muted-icon" /></div>
-          <button className="quick-action" onClick={onNew}><span className="quick-icon red"><FilePlus2 size={17} /></span><span><b>Create a quotation</b><small>Build and export a PDF</small></span><ChevronRight size={16} /></button>
-          <button className="quick-action" onClick={onManageProducts}><span className="quick-icon dark"><ShoppingBag size={17} /></span><span><b>Manage catalogue</b><small>Products and services</small></span><ChevronRight size={16} /></button>
-          <button className="quick-action" onClick={() => onNavigate('clients')}><span className="quick-icon blue"><Users size={17} /></span><span><b>Manage clients</b><small>Keep customer details ready</small></span><ChevronRight size={16} /></button>
-          <div className="total-value"><span>QUOTATION VALUE</span><strong>{money(total)}</strong><small>Across {data.quotations.length} saved quotation{data.quotations.length === 1 ? '' : 's'}</small></div>
+          {canBuild && <button className="quick-action" onClick={onNew}><span className="quick-icon red"><FilePlus2 size={17} /></span><span><b>Create a quotation</b><small>Build and export a PDF</small></span><ChevronRight size={16} /></button>}
+          {canAccessSection(currentUser, 'packages') && <button className="quick-action" onClick={onManageProducts}><span className="quick-icon dark"><ShoppingBag size={17} /></span><span><b>Manage packages</b><small>Products and services</small></span><ChevronRight size={16} /></button>}
+          {canAccessSection(currentUser, 'clients') && <button className="quick-action" onClick={() => onNavigate('clients')}><span className="quick-icon blue"><Users size={17} /></span><span><b>Manage clients</b><small>Keep customer details ready</small></span><ChevronRight size={16} /></button>}
+          <div className="total-value"><span>QUOTATION VALUE</span><strong>{money(total)}</strong><small>Across {quotations.length} saved quotation{quotations.length === 1 ? '' : 's'}</small></div>
         </div>
       </section>
-      <div className="dashboard-bottom">
-        <div className="tip-card"><div className="tip-icon"><ShieldCheck size={20} /></div><div><b>Your workspace is stored locally</b><p>Your clients, catalogue and quotations remain on this device. Create a backup regularly from Backup & Restore.</p></div><button onClick={() => onNavigate('backup')}>Open backups <ArrowRight size={14} /></button></div>
-      </div>
+      {canAccessSection(currentUser, 'backup') && <div className="dashboard-bottom">
+        <div className="tip-card"><div className="tip-icon"><ShieldCheck size={20} /></div><div><b>Your workspace is stored locally</b><p>Your clients, packages and quotations remain on this device. Create a backup regularly from Backup & Restore.</p></div><button onClick={() => onNavigate('backup')}>Open backups <ArrowRight size={14} /></button></div>
+      </div>}
     </>
   )
 }
@@ -1156,151 +1286,137 @@ function Builder({
   data,
   quote,
   existingQuote,
+  currentUser,
+  selectedOptionId,
+  onSelectOption,
   generatedPdf,
   onViewGeneratedPdf,
   busy,
+  savingDraft,
   onUpdate,
   onSelectClient,
-  onAddItem,
   onSaveDraft,
   onGeneratePdf,
   onAddClient,
   onEditClient,
   onAddItemForm,
-  onApplyPackage,
+  onUseTemplate,
+  onSaveTemplate,
 }: {
   data: AppData
   quote: Quote
+  currentUser: UserProfile
+  selectedOptionId: string
+  onSelectOption: (id: string) => void
   existingQuote: Quote | null
   generatedPdf: { filename: string } | null
   onViewGeneratedPdf: () => void
   busy: boolean
+  savingDraft: boolean
   onUpdate: (patch: Partial<Quote>) => void
   onSelectClient: (id: string) => void
-  onAddItem: (item: CatalogueItem) => void
   onSaveDraft: () => Promise<void>
   onGeneratePdf: () => void
   onAddClient: () => void
   onEditClient: (client: Client) => void
   onAddItemForm: () => void
-  onApplyPackage: (id: string) => void
+  onUseTemplate: (template: QuoteTemplate) => void
+  onSaveTemplate: () => void
 }) {
-  const [itemSearch, setItemSearch] = useState('')
-  const totals = calculateTotals(quote.lines, quote.discountType, quote.discountValue, data.settings.vatRate)
-  const client = data.clients.find((item) => item.id === quote.clientId)
-  const availableItems = data.catalogue.filter((item) =>
-    item.active && `${item.name} ${item.sku} ${item.category}`.toLowerCase().includes(itemSearch.toLowerCase()),
-  )
-  const packageGroups = new Map<string, { id: string; name: string; lines: QuoteLine[] }>()
-  quote.lines.forEach((line) => {
-    if (!line.packageInstanceId) return
-    const group = packageGroups.get(line.packageInstanceId) ?? {
-      id: line.packageId ?? '',
-      name: line.packageName ?? 'Quotation package',
-      lines: [],
+  const options = quoteOptions(quote)
+  const option = options.find((entry) => entry.id === selectedOptionId) ?? options[0]
+  const totals = calculateQuotePricing(option, data.settings.vatRate)
+  const draftLabel = savingDraft ? 'Saving draft…' : 'Save draft'
+  const pdfLabel = busy && !savingDraft ? 'Generating PDF…' : 'Generate PDF'
+  function addOption() {
+    const id = createId()
+    let number = options.length + 1
+    while (options.some((entry) => entry.name === `Option ${number}`)) number += 1
+    onUpdate({ alternatives: [...(quote.alternatives ?? []), { id, name: `Option ${number}`, lines: [], discountType: 'none', discountValue: 0 }] })
+    onSelectOption(id)
+  }
+  function renameOption(name: string) {
+    if (!option.id) onUpdate({ primaryOptionName: name })
+    else onUpdate({ alternatives: quote.alternatives?.map((entry) => entry.id === option.id ? { ...entry, name } : entry) })
+  }
+  function removeOption() {
+    if (option.id) {
+      onUpdate({ alternatives: quote.alternatives?.filter((entry) => entry.id !== option.id) })
+    } else {
+      const [replacement, ...alternatives] = quote.alternatives ?? []
+      if (!replacement) return
+      onUpdate({ primaryOptionName: replacement.name, lines: replacement.lines, pricing: replacement.pricing ?? {},
+        discountType: replacement.discountType, discountValue: replacement.discountValue, alternatives })
     }
-    group.lines.push(line)
-    packageGroups.set(line.packageInstanceId, group)
-  })
-  const individualLines = quote.lines.filter((line) => !line.packageInstanceId)
-  const packagePrice = (item: QuotePackage) => item.items.reduce((sum, entry) => {
-    const catalogueItem = data.catalogue.find((source) => source.id === entry.itemId)
-    return sum + (catalogueItem ? catalogueItem.priceCents * entry.quantity : 0)
-  }, 0)
-  function changeLine(id: string, patch: Partial<QuoteLine>) {
-    onUpdate({ lines: quote.lines.map((line) => line.id === id ? { ...line, ...patch } : line) })
+    onSelectOption('')
   }
-  function removePackage(instanceId: string) {
-    onUpdate({ lines: quote.lines.filter((line) => line.packageInstanceId !== instanceId) })
-  }
+  const client = data.clients.find((item) => item.id === quote.clientId)
   return (
     <>
       <div className="page-heading heading-split">
-        <div><div className="eyebrow">QUOTE BUILDER · {quote.number}</div><h1>{existingQuote ? 'Edit quotation' : 'New quotation'}</h1><p>Select a client, add packages to your quotation, and review the total before export.</p></div>
-        <div className="heading-actions"><button className="button button-secondary" onClick={() => void onSaveDraft()}><Check size={16} /> Save draft</button><button className="button button-primary" onClick={onGeneratePdf} disabled={busy}><FileText size={16} /> {busy ? 'Generating…' : 'Generate PDF'}</button></div>
+        <div><div className="eyebrow">QUOTE BUILDER · {quote.number}</div><h1>{existingQuote ? 'Edit quotation' : 'New quotation'}</h1><p>Build your item list and review once-off and monthly pricing before export.</p></div>
+        <div className="heading-actions"><button className="button button-secondary" disabled={busy} onClick={() => void onSaveDraft()}><Check size={16} /> {draftLabel}</button><button className="button button-primary" onClick={onGeneratePdf} disabled={busy}><FileText size={16} /> {pdfLabel}</button></div>
       </div>
       <div className="builder-layout">
         <div className="builder-main">
           <section className="panel builder-section">
-            <div className="section-title"><span className="step-number">01</span><div><h2>Client & quotation details</h2><p>Choose who this proposal is prepared for.</p></div></div>
+            <div className="section-title"><div><h2>Client & quotation details</h2><p>Choose who this proposal is prepared for.</p></div></div>
             <div className="form-grid form-grid-three">
-              <label className="field span-two"><span>Client <i>*</i></span><div className="select-with-action"><select id="quote-client" value={quote.clientId} onChange={(event) => onSelectClient(event.target.value)}><option value="">Select a client…</option>{data.clients.filter((item) => !item.archived).map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select><button className="mini-add" onClick={onAddClient} title="Add client"><Plus size={16} /></button></div></label>
+              <label className="field span-two"><span>Client</span><div className="select-with-action"><select id="quote-client" value={quote.clientId} onChange={(event) => onSelectClient(event.target.value)}><option value="">Select a client…</option>{data.clients.filter((item) => !item.archived).map((item) => <option value={item.id} key={item.id}>{clientDisplayName(item)}</option>)}</select><button id="quote-add-client" className="mini-add" onClick={onAddClient} title="Add client"><Plus size={16} /></button></div></label>
               <label className="field"><span>Quotation title</span><input value={quote.title} onChange={(event) => onUpdate({ title: event.target.value })} /></label>
               <label className="field"><span>Issue date</span><input type="date" value={quote.issueDate} onChange={(event) => onUpdate({ issueDate: event.target.value })} /></label>
               <label className="field"><span>Valid until</span><input type="date" value={quote.validUntil} onChange={(event) => onUpdate({ validUntil: event.target.value })} /></label>
-              <div className="client-summary span-three">{client ? <><div className="client-avatar">{client.name.slice(0, 1).toUpperCase()}</div><div><b>{quote.clientSnapshot.name}</b><small>{[quote.clientSnapshot.contact, quote.clientSnapshot.email, quote.clientSnapshot.phone].filter(Boolean).join(' · ') || 'Client contact details can be edited in Clients.'}</small></div><button className="text-button" onClick={() => onEditClient(client)}>Edit details</button></> : <><Users size={17} /><span>{data.clients.some((item) => !item.archived) ? 'Select a saved client to automatically populate the quotation.' : 'Add your first client to enable saving and PDF export.'}</span><button className="text-button" onClick={onAddClient}>{data.clients.some((item) => !item.archived) ? 'Add client' : 'Create first client'} <Plus size={14} /></button></>}</div>
+              <div className="client-summary span-three">{client ? <><div className="client-avatar">{quote.clientSnapshot.details?.logo ? <img src={quote.clientSnapshot.details.logo} alt="" /> : clientDisplayName(quote.clientSnapshot).slice(0, 1).toUpperCase()}</div><div><b>{clientDisplayName(quote.clientSnapshot)}</b><small>{[quote.clientSnapshot.contact, quote.clientSnapshot.email, quote.clientSnapshot.phone].filter(Boolean).join(' · ') || 'Client contact details can be edited in Clients.'}</small></div><button className="text-button" onClick={() => onEditClient(client)}>Edit details</button></> : <><Users size={17} /><span>Choose or add a client before generating the PDF.</span><button className="text-button" onClick={onAddClient}>Add client <Plus size={14} /></button></>}</div>
             </div>
+            <QuoteCustomerDetails quote={quote} onUpdate={onUpdate} />
           </section>
 
-          <section className="panel builder-section">
-            <div className="section-title"><span className="step-number">02</span><div><h2>Add items</h2><p>Add products or services from your catalogue, or create a custom item.</p></div></div>
-            <div className="builder-tools">
-              <label className="search-field item-search"><Search size={16} /><input placeholder="Search catalogue…" value={itemSearch} onChange={(event) => setItemSearch(event.target.value)} /></label>
-              <button className="button button-secondary button-compact" onClick={onAddItemForm}><Plus size={15} /> Custom item</button>
+          <section className="panel offer-options" aria-label="Offer options">
+            <div className="offer-options-nav">
+              {options.map((entry, index) => <button type="button" key={entry.id} className="button button-secondary button-compact"
+                aria-pressed={entry.id === option.id} onClick={() => onSelectOption(entry.id)}>{entry.name || `Option ${index + 1}`}</button>)}
+              <button type="button" className="button button-secondary button-compact" onClick={addOption}><Plus size={15} /> Add option</button>
+              {!!quote.clientId && options.some((entry) => entry.lines.some((line) => !line.packageFeatures && line.name.trim() && line.quantity > 0)) &&
+                <button type="button" className="button button-secondary button-compact" onClick={onSaveTemplate}>Save as template</button>}
+              {!!data.quoteTemplates.length && <label className="field quick-template"><span>Quick quote from template</span>
+                <select value="" onChange={(event) => {
+                  const template = data.quoteTemplates.find((entry) => entry.id === event.target.value)
+                  if (template) onUseTemplate(template)
+                }}><option value="">Choose a template…</option>{data.quoteTemplates.map((template) =>
+                  <option key={template.id} value={template.id}>{template.name}</option>)}</select>
+              </label>}
             </div>
-            <div className="catalogue-suggestions">
-              {availableItems.slice(0, 5).map((item) => <button className="suggestion" key={item.id} onClick={() => onAddItem(item)}><span className="suggestion-plus"><Plus size={14} /></span><span className="suggestion-copy"><b>{item.name}</b><small>{item.sku || item.category || item.unit}</small></span><strong>{money(item.priceCents)}</strong></button>)}
-              {!availableItems.length && <div className="suggestion-empty">No active catalogue items match this search. Add items in Catalogue.</div>}
-            </div>
+            {options.length > 1 && <div className="offer-option-edit">
+              <label className="field"><span>Option name</span><input maxLength={55} value={option.name} onChange={(event) => renameOption(event.target.value)} /></label>
+              <button type="button" className="button button-secondary button-compact" onClick={removeOption}>Remove option</button>
+            </div>}
           </section>
+          <QuoteWorkbench key={`${quote.id}:${option.id}`} data={data} lines={option.lines} totals={totals}
+            makeLine={(item, includeAccessories) => makeLine(item, data.catalogue, includeAccessories)} onChange={(lines) => onUpdate({ lines })}
+            onCustom={onAddItemForm} />
 
           <section className="panel builder-section">
-            <div className="section-title"><span className="step-number">03</span><div><h2>Packages</h2><p>Choose from packages created in the Packages section. Package contents are included in the quotation total.</p></div><span className="line-count">{packageGroups.size} selected</span></div>
-            {data.packages.length ? <div className="builder-package-grid">{data.packages.map((item) => {
-              const selectedCount = [...packageGroups.values()].filter((group) => group.id === item.id).length
-              return <article className="builder-package-card" key={item.id}>
-                <div className="builder-package-heading"><span className="builder-package-icon"><PackageOpen size={17} /></span><span className="builder-package-price">{money(packagePrice(item))}</span></div>
-                <h3>{item.name}</h3>
-                <p>{item.description || 'Reusable product and service package.'}</p>
-                <div className="package-items">{item.items.map((entry) => <span key={entry.itemId}>{data.catalogue.find((source) => source.id === entry.itemId)?.name ?? 'Unavailable item'} × {entry.quantity}</span>)}</div>
-                <button className="button button-secondary full-button" onClick={() => onApplyPackage(item.id)}><Plus size={15} /> Add package{selectedCount ? ` (${selectedCount} added)` : ''}</button>
-              </article>
-            })}</div> : <div className="empty-lines"><div className="empty-icon"><PackageOpen size={21} /></div><b>No packages created yet</b><span>Create your packages in the Packages section. They will appear here to add to your quotation.</span></div>}
-            {[...packageGroups.entries()].length > 0 && <div className="selected-package-list"><h3>Selected packages</h3>{[...packageGroups.entries()].map(([instanceId, group]) => {
-              const total = group.lines.reduce((sum, line) => sum + Math.round(line.quantity * line.unitPriceCents), 0)
-              return <article className="selected-package" key={instanceId}>
-                <div className="selected-package-heading"><div><PackageOpen size={16} /><b>{group.name}</b></div><strong>{money(total)}</strong><button className="row-remove" aria-label={`Remove package ${group.name}`} onClick={() => removePackage(instanceId)}><X size={15} /></button></div>
-                <div className="selected-package-lines">{group.lines.map((line) => <div className="selected-package-line" key={line.id}>
-                  <span>{line.name}</span>
-                  <label><small>{line.unit === 'hour' ? 'Hours' : 'Qty'}</small><input type="number" min="0.01" step="any" aria-label={`${line.unit === 'hour' ? 'Hours' : 'Quantity'} for ${line.name}`} value={line.quantity} onChange={(event) => changeLine(line.id, { quantity: Math.max(0, Number(event.target.value) || 0) })} /></label>
-                  <strong>{money(Math.round(line.quantity * line.unitPriceCents))}</strong>
-                </div>)}</div>
-              </article>
-            })}</div>}
-            {individualLines.length > 0 && <div className="selected-package-list"><h3>Additional items</h3><div className="additional-item-list">{individualLines.map((line) => <div className="additional-item" key={line.id}>
-              <div><b>{line.name}</b><small>{line.description || line.unit || 'Individual item'}</small></div>
-              <label><small>{line.unit === 'hour' ? 'Hours' : 'Qty'}</small><input type="number" min="0.01" step="any" aria-label={`${line.unit === 'hour' ? 'Hours' : 'Quantity'} for ${line.name}`} value={line.quantity} onChange={(event) => changeLine(line.id, { quantity: Math.max(0, Number(event.target.value) || 0) })} /></label>
-              <strong>{money(Math.round(line.quantity * line.unitPriceCents))}</strong>
-              <button className="row-remove" aria-label={`Remove ${line.name}`} onClick={() => onUpdate({ lines: quote.lines.filter((item) => item.id !== line.id) })}><X size={15} /></button>
-            </div>)}</div></div>}
-          </section>
-
-          <section className="panel builder-section">
-            <div className="section-title"><span className="step-number">04</span><div><h2>Notes & terms</h2><p>Add any relevant details for this proposal.</p></div></div>
-            <label className="field"><span>Project notes / scope of work</span><textarea rows={3} placeholder="Optional project notes. Leave blank to hide this section in the PDF." value={quote.notes} onChange={(event) => onUpdate({ notes: event.target.value })} /></label>
+            <div className="section-title"><div><h2>Notes & terms</h2><p>Add any relevant details for this proposal.</p></div></div>
+            <label className="field"><span>Quote notes / scope of work</span><textarea rows={3} placeholder="Optional project notes. Leave blank to hide this section in the PDF." value={quote.notes} onChange={(event) => onUpdate({ notes: event.target.value })} /></label>
             <label className="field terms-field"><span>Quotation terms <small>Default ordering terms are included and saved with this quotation.</small></span><textarea rows={3} placeholder="Default ordering terms are applied automatically." value={quote.terms.map((term) => term.replace('|', ' — ')).join('\n')} onChange={(event) => onUpdate({ terms: event.target.value.split('\n').filter(Boolean) })} /></label>
           </section>
         </div>
 
         <aside className="builder-side">
           <div className="preview-card">
-            <div className="preview-heading"><div><span className="eyebrow">LIVE SUMMARY</span><h3>Quotation total</h3></div><Calculator size={19} /></div>
+            <div className="preview-heading"><div><span className="eyebrow">INTERNAL SUMMARY</span><h3>{option.name || 'Quotation pricing'}</h3></div><Calculator size={19} /></div>
             <div className="preview-meta"><span>Quote number</span><b>{quote.number}</b></div>
-            <div className="preview-meta"><span>Client</span><b>{quote.clientSnapshot.name || 'Not selected'}</b></div>
-            <div className="preview-meta"><span>Line items</span><b>{quote.lines.length}</b></div>
+            <div className="preview-meta"><span>Client</span><b>{clientDisplayName(quote.clientSnapshot) || 'Not selected'}</b></div>
+            <div className="preview-meta"><span>Line items</span><b>{option.lines.length}</b></div>
             <div className="preview-divider" />
-            <div className="preview-meta"><span>Subtotal ex. VAT</span><b>{money(totals.subtotalCents)}</b></div>
-            <div className="discount-control"><label htmlFor="discount-type">Discount</label><select id="discount-type" value={quote.discountType} onChange={(event) => onUpdate({ discountType: event.target.value as Quote['discountType'] })}><option value="none">None</option><option value="fixed">Fixed amount</option><option value="percentage">Percentage</option></select>{quote.discountType !== 'none' && <input aria-label="Discount value" type="number" min="0" step="0.01" value={quote.discountValue} onChange={(event) => onUpdate({ discountValue: Math.max(0, Number(event.target.value) || 0) })} />}</div>
-            <div className="preview-meta"><span>Discount</span><b>-{money(totals.discountCents)}</b></div>
-            <div className="preview-meta"><span>VAT ({data.settings.vatRate}%)</span><b>{money(totals.vatCents)}</b></div>
-            <div className="grand-total"><span>Total incl. VAT</span><strong>{money(totals.totalCents)}</strong></div>
-            <p className="tax-note">Tax is applied only to taxable items. Final totals are calculated from the line-item VAT settings.</p>
-            <button className="button button-primary full-button" disabled={busy} onClick={() => void onSaveDraft()}><Check size={16} /> Save draft</button>
-            <button className="button button-dark full-button" disabled={busy} onClick={onGeneratePdf}><FileText size={16} /> {busy ? 'Generating PDF…' : 'Generate PDF'}</button>
+            <PaymentOptions key={`${quote.id}:${option.id}`} quote={{ ...quote, ...option }} totals={totals}
+              vatRate={data.settings.vatRate} plans={data.settings.paymentPlans ?? DEFAULT_PAYMENT_PLANS} onUpdate={onUpdate} />
+            <button className="button button-primary full-button" disabled={busy} onClick={() => void onSaveDraft()}><Check size={16} /> {draftLabel}</button>
+            <button className="button button-dark full-button" disabled={busy} onClick={onGeneratePdf}><FileText size={16} /> {pdfLabel}</button>
             {generatedPdf && <button className="button button-secondary full-button" onClick={onViewGeneratedPdf}><FileText size={16} /> View generated PDF</button>}
-            <p className="auto-save-note">Valid drafts save automatically as you edit.</p>
+            {quote.status === 'Draft' && <p className="auto-save-note">Drafts with items save automatically as you edit.</p>}
           </div>
-          <PdfPreview quote={quote} settings={data.settings} />
+          <PdfPreview quote={quote} settings={{ ...data.settings, preparedBy: currentUser.fullName }} />
           <div className="side-note"><ShieldCheck size={17} /><span>Generating a PDF finalises a snapshot of the current pricing, client details and terms.</span></div>
         </aside>
       </div>
@@ -1381,45 +1497,6 @@ function PdfPreview({ quote, settings, large = false }: { quote: Quote; settings
   )
 }
 
-function CataloguePage({
-  items,
-  categories,
-  filter,
-  search,
-  onSearch,
-  onFilter,
-  onAdd,
-  onEdit,
-  onExport,
-  onImport,
-}: {
-  items: CatalogueItem[]
-  categories: string[]
-  filter: string
-  search: string
-  onSearch: (value: string) => void
-  onFilter: (value: string) => void
-  onAdd: () => void
-  onEdit: (item: CatalogueItem) => void
-  onExport: () => void
-  onImport: (file: File) => void
-}) {
-  const filterSelectRef = useRef<HTMLSelectElement>(null)
-  return (
-    <>
-      <div className="page-heading heading-split"><div><div className="eyebrow">PRODUCTS & SERVICES</div><h1>Catalogue</h1><p>Manage the items available in your quotations.</p></div><button className="button button-primary" onClick={onAdd}><Plus size={17} /> Add item</button></div>
-      <div className="panel data-panel">
-        <div className="data-toolbar"><label className="search-field"><Search size={16} /><input placeholder="Search name, SKU or category…" value={search} onChange={(event) => onSearch(event.target.value)} /></label><div className="filter-field"><ListFilter size={15} /><select ref={filterSelectRef} aria-label="Filter by category" value={filter} onChange={(event) => onFilter(event.target.value)}>{categories.map((category) => <option key={category}>{category}</option>)}</select><button type="button" className="filter-arrow" aria-label="Open category filter" onClick={() => filterSelectRef.current?.showPicker()}><ChevronDown size={14} /></button></div><div className="toolbar-spacer" /><label className="button button-secondary button-compact file-label"><Upload size={15} /> Import CSV<input type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) onImport(file); event.currentTarget.value = '' }} /></label><button className="button button-secondary button-compact" onClick={onExport}><ArrowDownToLine size={15} /> Export</button></div>
-        <div className="table-wrap"><table><thead><tr><th>ITEM</th><th>SKU</th><th>CATEGORY</th><th>UNIT</th><th>VAT</th><th className="align-right">PRICE EX. VAT</th><th /></tr></thead><tbody>
-          {items.map((item) => <tr key={item.id}><td><b>{item.name}</b><small className="description-cell">{item.description || 'No description'}</small></td><td>{item.sku || '—'}</td><td>{item.category}</td><td>{item.unit}</td><td><span className={item.vatApplicable ? 'vat-yes' : 'vat-no'}>{item.vatApplicable ? '15% VAT' : 'Exempt'}</span></td><td className="align-right amount">{money(item.priceCents)}</td><td><button className="table-action" onClick={() => onEdit(item)}>Edit</button></td></tr>)}
-        </tbody></table>
-        {!items.length && <EmptyState title="No catalogue items found" text="Add your first product or service, or import items from a CSV file." action="Add catalogue item" onAction={onAdd} />}
-        </div><div className="table-footer"><span>{items.length} active catalogue item{items.length === 1 ? '' : 's'}</span><span>Prices shown excluding VAT</span></div>
-      </div>
-    </>
-  )
-}
-
 function ClientsPage({
   clients,
   search,
@@ -1439,7 +1516,7 @@ function ClientsPage({
     <>
       <div className="page-heading heading-split"><div><div className="eyebrow">CUSTOMER DIRECTORY</div><h1>Clients</h1><p>Save customer details once and reuse them in every quotation.</p></div><button className="button button-primary" onClick={onAdd}><Plus size={17} /> Add client</button></div>
       <div className="panel data-panel"><div className="data-toolbar"><label className="search-field"><Search size={16} /><input placeholder="Search company, contact or email…" value={search} onChange={(event) => onSearch(event.target.value)} /></label><div className="toolbar-spacer" /><span className="toolbar-count"><Users size={15} /> {clients.filter((client) => !client.archived).length} active clients</span></div>
-        <div className="table-wrap"><table><thead><tr><th>COMPANY</th><th>CONTACT</th><th>EMAIL</th><th>PHONE</th><th>VAT NUMBER</th><th /></tr></thead><tbody>{clients.filter((client) => !client.archived).map((client) => <tr key={client.id}><td><b>{client.name}</b><small>{[client.city, client.province].filter(Boolean).join(', ') || 'Location not set'}</small></td><td>{client.contact || '—'}</td><td>{client.email || '—'}</td><td>{client.phone || '—'}</td><td>{client.vatNumber || '—'}</td><td><div className="row-actions"><button className="table-action" onClick={() => onEdit(client)}>Edit</button><button className="table-action danger-link" onClick={() => onArchive(client)}>Archive</button></div></td></tr>)}</tbody></table>{!clients.some((client) => !client.archived) && <EmptyState title="No clients added yet" text="Create a client profile to automatically fill in quotation details." action="Add client" onAction={onAdd} />}</div>
+        <div className="table-wrap"><table><thead><tr><th>COMPANY</th><th>CONTACT</th><th>EMAIL</th><th>PHONE</th><th>VAT NUMBER</th><th /></tr></thead><tbody>{clients.filter((client) => !client.archived).map((client) => <tr key={client.id}><td><b>{clientDisplayName(client)}</b><small>{[client.city, client.province].filter(Boolean).join(', ') || 'Location not set'}</small></td><td>{client.contact || '—'}</td><td>{client.email || '—'}</td><td>{client.phone || '—'}</td><td>{client.vatNumber || '—'}</td><td><div className="row-actions"><button className="table-action" onClick={() => onEdit(client)}>Edit</button><button className="table-action danger-link" onClick={() => onArchive(client)}>Archive</button></div></td></tr>)}</tbody></table>{!clients.some((client) => !client.archived) && <EmptyState title="No clients added yet" text="Create a client profile to automatically fill in quotation details." action="Add client" onAction={onAdd} />}</div>
         <div className="table-footer"><span>Client details are stored locally on this device.</span></div>
       </div>
     </>
@@ -1448,51 +1525,73 @@ function ClientsPage({
 
 function HistoryPage({
   quotes,
+  scope,
   search,
   status,
+  creator,
+  creators,
+  dateRange,
+  onDateRange,
   onSearch,
   onStatus,
+  onCreator,
   onOpen,
+  onExport,
   onStatusChange,
   onDuplicate,
+  onNew,
 }: {
   quotes: Quote[]
+  scope: 'all' | 'mine'
   search: string
   status: string
+  creator: string
+  creators: string[]
+  dateRange: { from: string; to: string }
+  onDateRange: (value: { from: string; to: string }) => void
   onSearch: (value: string) => void
   onStatus: (value: string) => void
+  onCreator: (value: string) => void
   onOpen: (quote: Quote) => void
+  onExport: (quotes: Quote[], type: ReportType, format: 'xlsx' | 'csv') => Promise<void>
   onStatusChange: (quote: Quote, status: QuoteStatus) => void
   onDuplicate: (quote: Quote) => void
+  onNew?: () => void
 }) {
   const options = ['All statuses', 'Draft', 'Finalised', 'Sent', 'Accepted', 'Rejected', 'Expired', 'Cancelled']
+  const [reportType, setReportType] = useState<ReportType>(reportTypes[0])
   const statusSelectRef = useRef<HTMLSelectElement>(null)
+  const creatorSelectRef = useRef<HTMLSelectElement>(null)
+  const invalidRange = Boolean(dateRange.from && dateRange.to && dateRange.from > dateRange.to)
   return (
     <>
-      <div className="page-heading heading-split"><div><div className="eyebrow">SAVED QUOTATIONS</div><h1>Quotation history</h1><p>Search, review and manage your quotation records.</p></div></div>
-      <div className="panel data-panel"><div className="data-toolbar"><label className="search-field"><Search size={16} /><input placeholder="Search quote number, client or title…" value={search} onChange={(event) => onSearch(event.target.value)} /></label><div className="filter-field"><ListFilter size={15} /><select ref={statusSelectRef} aria-label="Filter by quotation status" value={status} onChange={(event) => onStatus(event.target.value)}>{options.map((item) => <option key={item}>{item}</option>)}</select><button type="button" className="filter-arrow" aria-label="Open status filter" onClick={() => statusSelectRef.current?.showPicker()}><ChevronDown size={14} /></button></div></div>
-        <div className="table-wrap"><table><thead><tr><th>QUOTE</th><th>CLIENT</th><th>ISSUED</th><th>VALID UNTIL</th><th>STATUS</th><th className="align-right">TOTAL INCL. VAT</th><th /></tr></thead><tbody>{quotes.map((quote) => <tr key={quote.id} onClick={() => onOpen(quote)}><td><b>{quote.number}</b><small>{quote.title}</small></td><td>{quote.clientSnapshot.name}</td><td>{quote.issueDate}</td><td>{quote.validUntil}</td><td><select className={statusTone(quote.status)} value={quote.status} onClick={(event) => event.stopPropagation()} onChange={(event) => void onStatusChange(quote, event.target.value as QuoteStatus)}>{options.slice(1).map((item) => <option key={item}>{item}</option>)}</select></td><td className="align-right amount">{money(quote.totalCents)}</td><td><button className="table-action" title="Duplicate quotation" onClick={(event) => { event.stopPropagation(); onDuplicate(quote) }}><Copy size={15} /></button></td></tr>)}</tbody></table>{!quotes.length && <EmptyState title="No quotations to show" text="Try changing your search or status filter." />}</div>
-        <div className="table-footer"><span>{quotes.length} quotation{quotes.length === 1 ? '' : 's'} shown</span><span>Saved quotations retain their client, item, tax and terms snapshots.</span></div>
+      <div className="page-heading heading-split">
+        <div><div className="eyebrow">{scope === 'mine' ? 'YOUR WORK' : 'SAVED QUOTATIONS'}</div><h1>{scope === 'mine' ? 'My quotations' : 'Quotation history'}</h1><p>{scope === 'mine' ? 'View and manage quotations you created.' : 'Search, review and manage all quotation records.'}</p></div>
+        <div className="data-toolbar">
+          {onNew && <button className="button button-primary" onClick={onNew}><Plus size={16} /> New quotation</button>}
+          <label className="filter-field">
+            <select aria-label="Report type" value={reportType} onChange={(event) => setReportType(event.target.value as ReportType)}>
+              {reportTypes.map((type) => <option key={type}>{type}</option>)}
+            </select>
+          </label>
+          <button className="button button-secondary" disabled={!quotes.length} onClick={() => void onExport(quotes, reportType, 'xlsx')}>
+            <ArrowDownToLine size={16} /> Export spreadsheet
+          </button>
+          <button className="button button-secondary" disabled={!quotes.length} onClick={() => void onExport(quotes, reportType, 'csv')}>
+            Export CSV
+          </button>
+        </div>
       </div>
-    </>
-  )
-}
-
-function PackagesPage({
-  packages,
-  catalogue,
-  onAdd,
-  onAddToQuote,
-}: {
-  packages: QuotePackage[]
-  catalogue: CatalogueItem[]
-  onAdd: () => void
-  onAddToQuote: (item: QuotePackage) => void
-}) {
-  return (
-    <>
-      <div className="page-heading heading-split"><div><div className="eyebrow">REUSABLE COLLECTIONS</div><h1>Quotation packages</h1><p>Bundle products and services you often quote together.</p></div><button className="button button-primary" onClick={onAdd}><Plus size={17} /> Create package</button></div>
-      {!packages.length ? <div className="panel empty-feature"><div className="empty-feature-icon"><PackageOpen size={25} /></div><h2>No packages yet</h2><p>Group catalogue items into reusable sets to add them to quotations in one click.</p><button className="button button-primary" onClick={onAdd}><Plus size={16} /> Create your first package</button></div> : <div className="feature-grid">{packages.map((item) => <article className="feature-card" key={item.id}><div className="feature-card-icon"><PackageOpen size={19} /></div><span className="feature-count">{item.items.length} item{item.items.length === 1 ? '' : 's'}</span><h2>{item.name}</h2><p>{item.description || 'A reusable group of catalogue items.'}</p><div className="package-items">{item.items.map((entry) => <span key={entry.itemId}>{catalogue.find((source) => source.id === entry.itemId)?.name ?? 'Archived catalogue item'} × {entry.quantity}</span>)}</div><button className="button button-secondary full-button" onClick={() => onAddToQuote(item)}><Plus size={15} /> Add to quotation</button></article>)}</div>}
+      <div className="panel data-panel"><div className="data-toolbar"><label className="search-field"><Search size={16} /><input placeholder={scope === 'mine' ? 'Search quote #, client, title, date or total…' : 'Search quote #, client, title, creator, date or total…'} value={search} onChange={(event) => onSearch(event.target.value)} /></label><div className="filter-field"><ListFilter size={15} /><select ref={statusSelectRef} aria-label="Filter by quotation status" value={status} onChange={(event) => onStatus(event.target.value)}>{options.map((item) => <option key={item}>{item}</option>)}</select><button type="button" className="filter-arrow" aria-label="Open status filter" onClick={() => statusSelectRef.current?.showPicker()}><ChevronDown size={14} /></button></div>{scope === 'all' && <div className="filter-field"><ListFilter size={15} /><select ref={creatorSelectRef} aria-label="Filter by quotation creator" value={creator} onChange={(event) => onCreator(event.target.value)}><option>{ALL_HISTORY_CREATORS}</option><option value={UNRECORDED_HISTORY_CREATOR}>Not recorded</option>{creators.map((item) => <option key={item}>{item}</option>)}</select><button type="button" className="filter-arrow" aria-label="Open creator filter" onClick={() => creatorSelectRef.current?.showPicker()}><ChevronDown size={14} /></button></div>}</div>
+        <div className="data-toolbar">
+          <label className="field"><span>Issued from</span><input type="date" value={dateRange.from} max={dateRange.to || undefined} onChange={(event) => onDateRange({ ...dateRange, from: event.target.value })} /></label>
+          <label className="field"><span>Issued through</span><input type="date" value={dateRange.to} min={dateRange.from || undefined} onChange={(event) => onDateRange({ ...dateRange, to: event.target.value })} /></label>
+          <button className="button button-secondary" onClick={() => { onDateRange({ from: '', to: '' }); onStatus('All statuses'); if (scope === 'all') onCreator(ALL_HISTORY_CREATORS); onSearch('') }}>Clear filters</button>
+          {invalidRange && <span role="alert">The end date must be on or after the start date.</span>}
+        </div>
+        <div className="table-wrap"><table><thead><tr><th>QUOTE</th><th>CLIENT</th>{scope === 'all' && <th>CREATED BY</th>}<th>ISSUED</th><th>VALID UNTIL</th><th>STATUS</th><th className="align-right">TOTAL INCL. VAT</th><th /></tr></thead><tbody>{quotes.map((quote) => <tr key={quote.id} onClick={() => onOpen(quote)}><td><b>{quote.number}</b><small>{quote.title}</small></td><td>{clientDisplayName(quote.clientSnapshot) || 'No client'}</td>{scope === 'all' && <td>{quote.createdBy || 'Not recorded'}</td>}<td>{quote.issueDate}</td><td>{quote.validUntil}</td><td><select className={statusTone(quote.status)} value={quote.status} onClick={(event) => event.stopPropagation()} onChange={(event) => void onStatusChange(quote, event.target.value as QuoteStatus)}>{options.slice(1).map((item) => <option key={item}>{item}</option>)}</select></td><td className="align-right amount">{money(quote.totalCents)}</td><td><button className="table-action" title="Duplicate quotation" onClick={(event) => { event.stopPropagation(); onDuplicate(quote) }}><Copy size={15} /></button></td></tr>)}</tbody></table>{!quotes.length && <EmptyState title={scope === 'mine' ? 'No quotations created by you yet' : 'No quotations to show'} text={scope === 'mine' ? 'Create your first quotation to see it here.' : 'Try changing your search or filters.'} action={scope === 'mine' && onNew ? 'Create quotation' : undefined} onAction={onNew} />}</div>
+        <div className="table-footer"><span>{quotes.length} quotation{quotes.length === 1 ? '' : 's'} shown</span><span>{scope === 'mine' ? 'Only quotations you created are shown here.' : 'Saved quotations retain their client, item, tax and terms snapshots.'}</span></div>
+      </div>
     </>
   )
 }
@@ -1534,7 +1633,7 @@ function QuoteTemplatesPage({
               <h2>{item.name}</h2>
               <p>{item.description || item.quote.title}</p>
               <div className="package-items">
-                <span>Client: {item.quote.clientSnapshot.name || 'Not specified'}</span>
+                <span>Client: {clientDisplayName(item.quote.clientSnapshot) || 'Not specified'}</span>
                 <span>Based on {item.quote.number} · {item.quote.title}</span>
                 <span>Previous total: {money(item.quote.totalCents)}</span>
               </div>
@@ -1548,72 +1647,58 @@ function QuoteTemplatesPage({
   )
 }
 
-function SettingsPage({ settings, onSave }: { settings: CompanySettings; onSave: (event: FormEvent<HTMLFormElement>) => Promise<void> }) {
-  const [logoDataUrl, setLogoDataUrl] = useState(settings.logoDataUrl)
-  const [logoError, setLogoError] = useState('')
-  function loadLogo(file?: File) {
-    if (!file) return
-    if (!['image/png', 'image/jpeg'].includes(file.type)) {
-      setLogoError('Choose a PNG or JPEG image.')
-      return
-    }
-    if (file.size > 2_000_000) {
-      setLogoError('The logo must be 2 MB or smaller.')
-      return
-    }
-    setLogoError('')
-    const reader = new FileReader()
-    reader.onload = () => {
-      if (typeof reader.result === 'string') setLogoDataUrl(reader.result)
-    }
-    reader.onerror = () => setLogoError('The selected logo could not be read.')
-    reader.readAsDataURL(file)
-  }
-  return (
-    <>
-      <div className="page-heading"><div><div className="eyebrow">COMPANY PROFILE</div><h1>Settings</h1><p>Set the defaults used in new quotations and PDF exports.</p></div></div>
-      <form className="settings-layout" onSubmit={(event) => void onSave(event)}>
-        <div className="settings-main">
-          <section className="panel settings-card"><div className="panel-heading"><div><h2>Company information</h2><p>Shown on your branded quotation documents.</p></div><BriefcaseBusiness size={18} className="muted-icon" /></div><div className="form-grid form-grid-two"><label className="field"><span>Company name</span><input name="name" required defaultValue={settings.name} /></label><label className="field"><span>Prepared by</span><input name="preparedBy" defaultValue={settings.preparedBy} /></label><label className="field"><span>Registration number</span><input name="registrationNumber" defaultValue={settings.registrationNumber} /></label><label className="field"><span>VAT number</span><input name="vatNumber" defaultValue={settings.vatNumber} /></label><label className="field span-two"><span>Business address</span><input name="address" defaultValue={settings.address} /></label><label className="field"><span>Telephone</span><input name="phone" defaultValue={settings.phone} /></label><label className="field"><span>Email</span><input name="email" type="email" defaultValue={settings.email} /></label><label className="field"><span>Website</span><input name="website" defaultValue={settings.website} /></label><label className="field span-two"><span>Company logo (PNG or JPEG)</span><input type="file" accept="image/png,image/jpeg" onChange={(event) => loadLogo(event.target.files?.[0])} /><input type="hidden" name="logoDataUrl" value={logoDataUrl} />{logoError && <small className="logo-error">{logoError}</small>}{logoDataUrl && <div className="logo-preview"><img src={logoDataUrl} alt="Company logo preview" /><button type="button" className="table-action danger-link" onClick={() => { setLogoDataUrl(''); setLogoError('') }}>Remove logo</button></div>}</label></div></section>
-          <section className="panel settings-card"><div className="panel-heading"><div><h2>Quotation defaults</h2><p>Applied automatically when you start a new quotation.</p></div><Calculator size={18} className="muted-icon" /></div><div className="form-grid form-grid-two"><label className="field"><span>Quotation number prefix</span><input name="quotationPrefix" defaultValue={settings.quotationPrefix} /></label><label className="field"><span>Default validity period (days)</span><input name="validityDays" type="number" min="1" max="365" defaultValue={settings.validityDays} /></label><label className="field"><span>Default VAT rate (%)</span><input name="vatRate" type="number" min="0" max="100" step="0.01" defaultValue={settings.vatRate} /></label><label className="field span-two"><span>Default ordering terms <small>One paragraph per line; included with new quotations and PDF exports.</small></span><textarea name="defaultTerms" rows={12} defaultValue={settings.defaultTerms.map((term) => term.replace('|', ' — ')).join('\n')} /></label><label className="field span-two"><span>Additional payment terms</span><textarea name="paymentTerms" rows={2} defaultValue={settings.paymentTerms} placeholder="Optional extra wording." /></label><label className="field span-two"><span>Additional warranty terms</span><textarea name="warrantyTerms" rows={2} defaultValue={settings.warrantyTerms} placeholder="Optional extra wording." /></label><label className="field span-two"><span>Additional exclusions</span><textarea name="exclusions" rows={2} defaultValue={settings.exclusions} placeholder="Optional extra wording." /></label><label className="field span-two"><span>Additional acceptance wording</span><textarea name="acceptanceWording" rows={2} defaultValue={settings.acceptanceWording} placeholder="Optional extra wording." /></label></div><div className="settings-caution"><ShieldCheck size={17} /><span>Only add commercial terms approved by Techspire IT. Terms are saved with each quotation revision.</span></div></section>
-          <div className="settings-save"><button className="button button-primary"><Check size={16} /> Save settings</button></div>
-        </div>
-        <aside className="panel settings-aside"><div className="settings-aside-icon"><FileText size={20} /></div><h3>Your PDF document</h3><p>New PDFs use the Techspire red, black and white visual style and preserve the original quotation details.</p><ul><li><Check size={14} /> A4 layout</li><li><Check size={14} /> Rand pricing</li><li><Check size={14} /> Client and pricing snapshots</li><li><Check size={14} /> Dynamic line items</li></ul></aside>
-      </form>
-    </>
-  )
-}
-
 function BackupPage({ onExport, onImport }: { onExport: () => void; onImport: () => void }) {
   return (
     <>
       <div className="page-heading"><div><div className="eyebrow">DATA SAFETY</div><h1>Backup & restore</h1><p>Protect your local quotation data with a portable SQLite backup.</p></div></div>
       <div className="backup-grid">
-        <section className="panel backup-card"><div className="backup-card-icon"><ArrowDownToLine size={20} /></div><span className="eyebrow">CREATE A COPY</span><h2>Back up your data</h2><p>Export your clients, catalogue, quotation history and settings into a SQLite database file.</p><button className="button button-primary" onClick={onExport}><ArrowDownToLine size={16} /> Create backup</button></section>
-        <section className="panel backup-card"><div className="backup-card-icon pale"><Upload size={20} /></div><span className="eyebrow">RESTORE A COPY</span><h2>Restore a backup</h2><p>Load a previously created Techspire database backup. This replaces the data currently on this device.</p><button className="button button-secondary" onClick={() => { if (window.confirm('Restoring replaces all current local data. Continue?')) onImport() }}><Upload size={16} /> Choose backup file</button></section>
+        <section className="panel backup-card"><div className="backup-card-icon"><ArrowDownToLine size={20} /></div><span className="eyebrow">CREATE A COPY</span><h2>Back up your data</h2><p>Export your clients, packages, quotation history and settings into a SQLite database file.</p><button className="button button-primary" onClick={onExport}><ArrowDownToLine size={16} /> Create backup</button></section>
+        <section className="panel backup-card"><div className="backup-card-icon pale"><Upload size={20} /></div><span className="eyebrow">RESTORE A COPY</span><h2>Restore a backup</h2><p>Choose a Techspire database file or a ZIP containing one database backup. Restore replaces your current local quotation data.</p><button className="button button-secondary" onClick={onImport}><Upload size={16} /> Choose backup file</button></section>
       </div>
       <div className="backup-warning"><ShieldCheck size={17} /><span>Keep backups in a secure location. Client information and commercial quotations are included in the exported file.</span></div>
     </>
   )
 }
 
-function ClientForm({ client, onSubmit }: { client: Client | null; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <form className="modal-form" onSubmit={onSubmit}><div className="form-grid form-grid-two"><label className="field span-two"><span>Company name <i>*</i></span><input name="name" required autoFocus defaultValue={client?.name} /></label><label className="field"><span>Contact person</span><input name="contact" defaultValue={client?.contact} /></label><label className="field"><span>Email</span><input name="email" type="email" defaultValue={client?.email} /></label><label className="field"><span>Telephone</span><input name="phone" defaultValue={client?.phone} /></label><label className="field"><span>VAT number</span><input name="vatNumber" defaultValue={client?.vatNumber} /></label><label className="field span-two"><span>Street address</span><input name="address" defaultValue={client?.address} /></label><label className="field"><span>City</span><input name="city" defaultValue={client?.city} /></label><label className="field"><span>Province</span><input name="province" defaultValue={client?.province} /></label><label className="field"><span>Postal code</span><input name="postalCode" defaultValue={client?.postalCode} /></label></div><div className="modal-actions"><button type="button" className="button button-secondary" onClick={() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))}>Cancel</button><button className="button button-primary"><Check size={15} /> {client ? 'Save changes' : 'Save client'}</button></div></form>
-}
-
-function CatalogueForm({ item, allowTransient, onSubmit }: { item: CatalogueItem | null; allowTransient: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+function ProductForm({ item, parent, accessoryParent, legacyProducts, busy, onSubmit }: {
+  item: CatalogueItem | null
+  parent?: QuotePackage
+  accessoryParent: CatalogueItem | null
+  legacyProducts: CatalogueItem[]
+  busy: boolean
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+}) {
   const [hourly, setHourly] = useState(item?.unit === 'hour')
-  return <form className="modal-form" onSubmit={onSubmit}><div className="form-grid form-grid-two"><label className="field span-two"><span>Product or service name <i>*</i></span><input name="name" required autoFocus defaultValue={item?.name} /></label><label className="field span-two"><span>Description</span><textarea name="description" rows={3} defaultValue={item?.description} /></label><label className="field"><span>SKU / product code</span><input name="sku" defaultValue={item?.sku} /></label><label className="field"><span>Category</span><input name="category" list="category-suggestions" defaultValue={item?.category} /><datalist id="category-suggestions"><option>Hardware</option><option>Services</option><option>Networking</option><option>Security</option></datalist></label><label className="field"><span>Pricing type</span><select name="pricingType" value={hourly ? 'hourly' : 'fixed'} onChange={(event) => setHourly(event.target.value === 'hourly')}><option value="fixed">Fixed / per unit</option><option value="hourly">Hourly service (rate × hours)</option></select></label><label className="field"><span>Unit of measurement</span><input name="unit" disabled={hourly} defaultValue={item?.unit && item.unit !== 'hour' ? item.unit : 'each'} /></label>{hourly && <p className="field-hint span-two">Enter an hourly rate. Hours are multiplied by this rate in the quotation and are not printed in the PDF.</p>}<label className="field span-two"><span>Catalogue price (ZAR)</span><input name="price" type="number" min="0" step="0.01" required defaultValue={item ? item.priceCents / 100 : '0.00'} /></label><label className="check-field span-two"><input name="priceIncludesVat" type="checkbox" /><span>Entered catalogue price already includes VAT (stored excluding VAT)</span></label><label className="check-field span-two"><input name="vatApplicable" type="checkbox" defaultChecked={item?.vatApplicable ?? true} /><span>Apply VAT at the configured company rate</span></label>{allowTransient && <label className="check-field span-two"><input name="saveToCatalogue" type="checkbox" defaultChecked /><span>Save to catalogue for future quotations</span></label>}</div><div className="modal-actions"><button type="button" className="button button-secondary" onClick={() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))}>Cancel</button><button className="button button-primary"><Check size={15} /> Save item</button></div></form>
+  const [image, setImage] = useState(item?.imageDataUrl)
+  const siblings = accessoryParent ? productAccessories(accessoryParent, legacyProducts)
+    : parent ? packageProducts(parent, legacyProducts).map(({ item }) => item) : []
+  const headings = [...new Set(siblings.map((sibling) => sibling.productGroup).filter(Boolean))]
+  const action = item && parent ? 'Save changes' : accessoryParent ? 'Add feature' : parent ? 'Add product' : 'Add to quote'
+
+  return <form className="modal-form" onSubmit={onSubmit}>
+    {parent && <p className="modal-intro package-form-location">
+      <span>{parent.name}</span>
+      {accessoryParent && <><ChevronRight size={14} aria-hidden="true" /> <strong>{accessoryParent.name}</strong></>}
+    </p>}
+    <div className="form-grid form-grid-two"><div className="span-two"><ItemImage value={image} onChange={setImage} name={item?.name ?? (accessoryParent ? 'feature' : 'product')} /><input type="hidden" name="imageDataUrl" value={image ?? ''} /></div>
+      <label className="field span-two"><span>{accessoryParent ? 'Feature name' : 'Product or service name'} <i>*</i></span><input name="name" required autoFocus defaultValue={item?.name} /></label>
+      <label className="field span-two"><span>Description</span><textarea name="description" rows={3} defaultValue={item?.description} /></label>
+      <label className="field"><span>{accessoryParent ? 'SKU / feature code' : 'SKU / product code'}</span><input name="sku" defaultValue={item?.sku} /></label>{parent && <>
+      <label className="field"><span>{accessoryParent ? 'Feature heading' : 'Product heading'}</span><input name="productGroup" list="group-suggestions" placeholder={accessoryParent ? 'e.g. Paper feed' : 'e.g. Colour'} defaultValue={item?.productGroup} /><datalist id="group-suggestions">{headings.map((name) => <option key={name} value={name} />)}</datalist></label>{!accessoryParent && <label className="field"><span>Default quote quantity</span><input name="quantity" type="number" min="0.01" step="any" required defaultValue={parent.items.find((entry) => entry.itemId === item?.id)?.quantity ?? 1} /></label>}{accessoryParent && <label className="field span-two"><span>Single-choice group (optional)</span><input name="choiceGroup" defaultValue={item?.choiceGroup} /><small className="field-hint">The quote can include one feature from each single-choice group.</small></label>}</>}<label className="field"><span>Pricing type</span><select name="pricingType" value={hourly ? 'hourly' : 'fixed'} onChange={(event) => setHourly(event.target.value === 'hourly')}><option value="fixed">Fixed / per unit</option><option value="hourly">Hourly service (rate × hours)</option></select></label>
+      <label className="field"><span>Unit of measurement</span><input name="unit" disabled={hourly} defaultValue={item?.unit && item.unit !== 'hour' ? item.unit : 'each'} /></label>{hourly && <p className="field-hint span-two">The quotation multiplies this rate by the hours entered.</p>}<label className="field span-two"><span>{hourly ? 'Hourly rate (ZAR)' : 'Once-off selling price (ZAR)'}</span><input name="price" type="number" min="0" step="0.01" required defaultValue={item?.pricingPending ? '' : item ? item.priceCents / 100 : '0.00'} /></label>
+      <label className="field"><span>{hourly ? 'Hourly base cost ex. VAT (ZAR)' : 'Base cost ex. VAT (ZAR)'}</span><input name="cost" type="number" min="0" step="0.01" defaultValue={item?.costCents === undefined ? '' : item.costCents / 100} /></label>
+      <label className="field"><span>Monthly selling price (ZAR)</span><input name="monthly" type="number" min="0" step="0.01" defaultValue={(item?.monthlyCents ?? 0) / 100} /></label>
+      <label className="check-field span-two"><input name="priceIncludesVat" type="checkbox" /><span>Entered selling prices already include VAT (stored excluding VAT)</span></label>
+      <label className="check-field span-two"><input name="vatApplicable" type="checkbox" defaultChecked={item?.vatApplicable ?? true} /><span>Apply VAT at the configured company rate</span></label></div>
+    <div className="modal-actions">
+      <button type="button" className="button button-secondary" onClick={() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))}>Cancel</button><button className="button button-primary" disabled={busy}><Check size={15} /> {action}</button>
+    </div>
+  </form>
 }
 
-function CatalogueItemPicker({ catalogue }: { catalogue: CatalogueItem[] }) {
-  const activeItems = catalogue.filter((item) => item.active)
-  if (!activeItems.length) return <div className="catalogue-picker-empty">Add products or services to the catalogue first.</div>
-  return <div className="catalogue-picker">{activeItems.map((item) => <label className="catalogue-picker-item" key={item.id}><input type="checkbox" name="itemIds" value={item.id} /><span>{item.name}</span><small>{item.unit === 'hour' ? 'Hourly service' : money(item.priceCents)}</small></label>)}</div>
-}
-
-function PackageForm({ catalogue, onSubmit }: { catalogue: CatalogueItem[]; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <form className="modal-form" onSubmit={onSubmit}><p className="modal-intro">Choose as many products and services as needed. The default quantity is applied to each and can be changed in the quotation.</p><div className="form-grid form-grid-two"><label className="field span-two"><span>Package name <i>*</i></span><input name="name" required autoFocus placeholder="e.g. Office network setup" /></label><label className="field span-two"><span>Description</span><textarea name="description" rows={2} /></label><div className="field span-two"><span>Catalogue items</span><CatalogueItemPicker catalogue={catalogue} /><small>Tick each product or service to include.</small></div><label className="field"><span>Default quantity per item</span><input name="quantity" type="number" min="1" defaultValue="1" /></label></div><div className="modal-actions"><button type="button" className="button button-secondary" onClick={() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))}>Cancel</button><button className="button button-primary"><Check size={15} /> Save package</button></div></form>
+function PackageForm({ categories, headings, item, busy, onSubmit }: { categories: string[]; headings: string[]; busy: boolean; item: QuotePackage | null; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  const [image, setImage] = useState(item?.imageDataUrl)
+  return <form className="modal-form" onSubmit={onSubmit}><div className="form-grid form-grid-two"><div className="span-two"><ItemImage value={image} onChange={setImage} name={item?.name ?? 'package'} /><input type="hidden" name="imageDataUrl" value={image ?? ''} /></div><label className="field span-two"><span>Package name <i>*</i></span><input name="name" required autoFocus placeholder="e.g. Office network setup" defaultValue={item?.name} /></label><label className="field span-two"><span>Description</span><textarea name="description" rows={2} defaultValue={item?.description} /></label><label className="field span-two"><span>Package heading</span><input name="category" list="package-category-suggestions" placeholder="e.g. Connectivity" defaultValue={item?.category} /><datalist id="package-category-suggestions">{[...new Set([...categories, ...headings])].map((category) => <option key={category} value={category} />)}</datalist></label></div><div className="modal-actions"><button type="button" className="button button-secondary" onClick={() => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))}>Cancel</button><button className="button button-primary" disabled={busy}><Check size={15} /> {item ? 'Save changes' : 'Create package'}</button></div></form>
 }
 
 function QuoteTemplateForm({ quotations, onSubmit }: { quotations: Quote[]; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
@@ -1627,7 +1712,7 @@ function QuoteTemplateForm({ quotations, onSubmit }: { quotations: Quote[]; onSu
         <label className="field span-two"><span>Description</span><textarea name="description" rows={2} placeholder="Optional reminder about when to use this template." /></label>
         <label className="field span-two"><span>Starting quotation <i>*</i></span>
           <select name="quoteId" value={selectedQuoteId} required onChange={(event) => setSelectedQuoteId(event.target.value)}>
-            {quotations.map((item) => <option value={item.id} key={item.id}>{item.number} · {item.clientSnapshot.name} · {item.title}</option>)}
+            {quotations.map((item) => <option value={item.id} key={item.id}>{item.number} · {clientDisplayName(item.clientSnapshot)} · {item.title}</option>)}
           </select>
         </label>
         {selectedQuote && <p className="field-hint span-two">Includes {selectedQuote.lines.length} line item{selectedQuote.lines.length === 1 ? '' : 's'}, client details, pricing, discount, notes and ordering terms. Dates will be refreshed each time you use it.</p>}

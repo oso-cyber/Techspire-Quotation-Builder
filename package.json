@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "oxlint",
+    "lint": "oxlint src tests vite.config.ts",
     "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri",
@@ -19,6 +19,7 @@
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-fs": "^2.7.1",
     "@tauri-apps/plugin-sql": "^2.6.0",
+    "fflate": "^0.8.3",
     "jspdf": "^4.2.1",
     "lucide-react": "^1.63.0",
     "pdfjs-dist": "^6.4.299",
